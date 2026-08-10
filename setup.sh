@@ -26,9 +26,7 @@ else
   SUDO="sudo"
 fi
 
-if ! command -v apt-get >/dev/null 2>&1; then
-  fail "This installer currently supports Debian/Ubuntu systems with apt."
-fi
+command -v apt-get >/dev/null 2>&1 || fail "This installer supports Debian/Ubuntu systems with apt."
 
 info "Installing system packages..."
 $SUDO apt-get update -y
@@ -36,14 +34,13 @@ $SUDO apt-get install -y python3 python3-venv ca-certificates curl
 
 info "Preparing application directory..."
 $SUDO install -d -m 0755 "$APP_DIR"
-
 if ! id "$BOT_USER" >/dev/null 2>&1; then
   $SUDO useradd --system --home-dir "$APP_DIR" --shell /usr/sbin/nologin "$BOT_USER"
 fi
 
 info "Downloading bot source..."
 TMP_BOT="$(mktemp)"
-trap 'rm -f "$TMP_BOT"' EXIT
+trap 'rm -f "$TMP_BOT" "${PROJECTS_TMP:-}" "${ENV_TMP:-}" "${SERVICE_TMP:-}"' EXIT
 curl -fsSL --ipv4 "${RAW_BASE}/bot.py" -o "$TMP_BOT" || fail "Could not download bot.py from ${RAW_BASE}"
 $SUDO install -m 0644 "$TMP_BOT" "$APP_DIR/bot.py"
 
@@ -52,31 +49,57 @@ if [[ ! -x "$APP_DIR/.venv/bin/python" ]]; then
   $SUDO python3 -m venv "$APP_DIR/.venv"
 fi
 $SUDO "$APP_DIR/.venv/bin/python" -m pip install --upgrade pip
-$SUDO "$APP_DIR/.venv/bin/pip" install 'python-telegram-bot>=20,<23' 'hcloud>=2,<3' 'python-dotenv>=1,<2'
+$SUDO "$APP_DIR/.venv/bin/pip" install 'python-telegram-bot[job-queue]>=20,<23' 'hcloud>=2.23,<3' 'python-dotenv>=1,<2'
 
 echo
 info "Bot configuration"
 read -rsp "Telegram Bot Token: " TELEGRAM_TOKEN
 echo
-read -rsp "Hetzner API Token (Read/Write): " HETZNER_TOKEN
-echo
-read -rp "Allowed Telegram chat/user ID (example: -1001234567890): " ALLOWED_CHAT_ID
+read -rp "Allowed Telegram numeric User ID: " ALLOWED_USER_ID
 
 [[ -n "$TELEGRAM_TOKEN" ]] || fail "Telegram token cannot be empty."
-[[ -n "$HETZNER_TOKEN" ]] || fail "Hetzner token cannot be empty."
-if [[ -n "$ALLOWED_CHAT_ID" && ! "$ALLOWED_CHAT_ID" =~ ^-?[0-9]+$ ]]; then
-  fail "Allowed chat/user ID must be numeric."
-fi
-ALLOWED_CHAT_ID="${ALLOWED_CHAT_ID:-0}"
+[[ "$ALLOWED_USER_ID" =~ ^[0-9]+$ ]] || fail "Allowed Telegram User ID must be numeric."
+
+read -rp "Number of Hetzner projects [1]: " PROJECT_COUNT
+PROJECT_COUNT="${PROJECT_COUNT:-1}"
+[[ "$PROJECT_COUNT" =~ ^[1-9][0-9]*$ ]] || fail "Project count must be a positive integer."
+
+PROJECTS_TMP="$(mktemp)"
+chmod 600 "$PROJECTS_TMP"
+for ((i=1; i<=PROJECT_COUNT; i++)); do
+  echo
+  read -rp "Project ${i} display name [Project ${i}]: " PROJECT_NAME
+  PROJECT_NAME="${PROJECT_NAME:-Project ${i}}"
+  PROJECT_NAME="${PROJECT_NAME//$'\t'/ }"
+  PROJECT_NAME="${PROJECT_NAME//$'\n'/ }"
+  read -rsp "Hetzner API Token for ${PROJECT_NAME} (Read/Write): " PROJECT_TOKEN
+  echo
+  [[ -n "$PROJECT_TOKEN" ]] || fail "Hetzner token cannot be empty."
+  printf '%s\t%s\n' "$PROJECT_NAME" "$PROJECT_TOKEN" >> "$PROJECTS_TMP"
+done
+
+PROJECTS_B64="$($APP_DIR/.venv/bin/python - "$PROJECTS_TMP" <<'PY'
+import base64, json, sys
+items=[]
+with open(sys.argv[1], encoding='utf-8') as f:
+    for line in f:
+        name, token = line.rstrip('\n').split('\t', 1)
+        items.append({'name': name, 'token': token})
+raw=json.dumps(items, ensure_ascii=False, separators=(',', ':')).encode()
+print(base64.b64encode(raw).decode())
+PY
+)"
 
 ENV_TMP="$(mktemp)"
 cat > "$ENV_TMP" <<EOF
 TELEGRAM_BOT_TOKEN=${TELEGRAM_TOKEN}
-HETZNER_API_TOKEN=${HETZNER_TOKEN}
-ALLOWED_CHAT_ID=${ALLOWED_CHAT_ID}
+ALLOWED_USER_ID=${ALLOWED_USER_ID}
+HETZNER_PROJECTS_B64=${PROJECTS_B64}
+BOT_TIMEZONE=Asia/Tehran
+TRAFFIC_CHECK_TIME=23:30
+STATE_FILE=${APP_DIR}/.traffic_alert_state.json
 EOF
 $SUDO install -m 0600 "$ENV_TMP" "$APP_DIR/.env"
-rm -f "$ENV_TMP"
 
 $SUDO chown -R "$BOT_USER:$BOT_USER" "$APP_DIR"
 
@@ -104,7 +127,6 @@ PrivateTmp=true
 WantedBy=multi-user.target
 EOF
 $SUDO install -m 0644 "$SERVICE_TMP" "/etc/systemd/system/${SERVICE_NAME}.service"
-rm -f "$SERVICE_TMP"
 
 info "Starting service..."
 $SUDO systemctl daemon-reload
@@ -114,12 +136,15 @@ sleep 2
 if $SUDO systemctl is-active --quiet "$SERVICE_NAME"; then
   echo
   info "Installation completed successfully."
+  echo "Access is restricted to Telegram User ID: ${ALLOWED_USER_ID}"
+  echo "Projects: ${PROJECT_COUNT}"
+  echo "Traffic check: 23:30 Asia/Tehran"
   echo "Service: ${SERVICE_NAME}"
   echo "Status : systemctl status ${SERVICE_NAME}"
   echo "Logs   : journalctl -u ${SERVICE_NAME} -f"
   echo "Restart: systemctl restart ${SERVICE_NAME}"
 else
   warn "The service did not become active. Showing recent logs:"
-  $SUDO journalctl -u "$SERVICE_NAME" -n 30 --no-pager || true
+  $SUDO journalctl -u "$SERVICE_NAME" -n 40 --no-pager || true
   exit 1
 fi
