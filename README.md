@@ -101,18 +101,18 @@ Selected Project
 
 ## 💸 مانیتور موجودی Cost-Optimized
 
-ربات به‌صورت پیش‌فرض هر **۳ ساعت** موجودی پلن‌های ارزان Cost-Optimized را از API Hetzner بررسی می‌کند. خانواده‌های فعلی `CX` و `CAX` پوشش داده می‌شوند.
+ربات به‌صورت پیش‌فرض هر **۱ ساعت** موجودی پلن‌های ارزان Cost-Optimized را از API Hetzner بررسی می‌کند. خانواده‌های فعلی `CX` و `CAX` پوشش داده می‌شوند.
 
 وقتی یک پلن/Location که قبلاً موجود نبود Available شود، ربات یک اعلان می‌فرستد و در آن **تمام پلن‌های Cost-Optimized موجود را به تفکیک Location** لیست می‌کند. تا وقتی موجودی تغییر نکند پیام تکراری ارسال نمی‌شود؛ اگر موجودی تمام شود و بعداً دوباره برگردد، مجدداً هشدار داده می‌شود.
 
-بررسی دستی هم از منوی اصلی با گزینه **موجودی Cost-Optimized** در دسترس است.
+بررسی دستی هم از منوی اصلی با گزینه **موجودی Cost-Optimized** در دسترس است. مانیتور خودکار را نیز می‌توانید مستقیم از داخل ربات **روشن یا خاموش** کنید؛ وضعیت انتخاب‌شده روی دیسک ذخیره می‌شود و بعد از ری‌استارت باقی می‌ماند.
 
 > فیلد Availability در API Hetzner شاخص لحظه‌ای است و تضمین قطعی Allocation نیست؛ ممکن است بین نمایش Available و مرحله نهایی ساخت ظرفیت تمام شود.
 
 پیش‌فرض فاصله بررسی:
 
 ```env
-CHEAP_CHECK_HOURS=3
+CHEAP_CHECK_HOURS=1
 ```
 
 ## 🔁 تعویض خودکار Primary IPv4
@@ -271,7 +271,7 @@ ALLOWED_USER_ID=123456789
 HETZNER_PROJECTS_B64=...
 BOT_TIMEZONE=Asia/Tehran
 TRAFFIC_CHECK_TIME=23:30
-CHEAP_CHECK_HOURS=3
+CHEAP_CHECK_HOURS=1
 STATE_FILE=/opt/hetzner-telegram-bot/.traffic_alert_state.json
 AVAILABILITY_STATE_FILE=/opt/hetzner-telegram-bot/.cost_optimized_state.json
 ```

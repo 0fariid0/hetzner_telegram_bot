@@ -18,7 +18,7 @@ CYAN='\033[0;36m'
 BOLD='\033[1m'
 NC='\033[0m'
 
-INSTALLER_VERSION="7.0"
+INSTALLER_VERSION="8.0"
 TTY_FD=0
 if [[ -r /dev/tty && -w /dev/tty ]]; then
   exec 3<>/dev/tty
@@ -263,7 +263,7 @@ ALLOWED_USER_ID=${allowed_user}
 HETZNER_PROJECTS_B64=${projects_b64}
 BOT_TIMEZONE=Asia/Tehran
 TRAFFIC_CHECK_TIME=23:30
-CHEAP_CHECK_HOURS=3
+CHEAP_CHECK_HOURS=1
 STATE_FILE=${APP_DIR}/.traffic_alert_state.json
 AVAILABILITY_STATE_FILE=${APP_DIR}/.cost_optimized_state.json
 EOF
@@ -291,10 +291,12 @@ update_flow() {
   download_file "setup.sh" "$APP_DIR/setup.sh" 0755
   download_file "README.md" "$APP_DIR/README.md" 0644 || true
   install_python_deps
+  # v8+: Cost-Optimized availability checks run hourly. Keep all other existing settings.
+  set_env_value "CHEAP_CHECK_HOURS" "1"
   write_service
   $SUDO chown -R "$BOT_USER:$BOT_USER" "$APP_DIR"
   restart_service
-  info "Update completed. Existing tokens and settings were preserved."
+  info "Update completed. Existing tokens and settings were preserved; Cost-Optimized checks are now hourly."
 }
 
 load_projects_file() {

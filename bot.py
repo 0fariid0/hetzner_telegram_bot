@@ -35,7 +35,7 @@ PROJECTS_B64 = os.getenv("HETZNER_PROJECTS_B64", "").strip()
 BOT_TIMEZONE = os.getenv("BOT_TIMEZONE", "Asia/Tehran").strip() or "Asia/Tehran"
 TRAFFIC_CHECK_TIME = os.getenv("TRAFFIC_CHECK_TIME", "23:30").strip() or "23:30"
 TRAFFIC_ALERT_TB = (18.0, 19.0, 20.0)
-CHEAP_CHECK_HOURS = float(os.getenv("CHEAP_CHECK_HOURS", "3") or 3)
+CHEAP_CHECK_HOURS = float(os.getenv("CHEAP_CHECK_HOURS", "1") or 1)
 STATE_FILE = Path(os.getenv("STATE_FILE", "/opt/hetzner-telegram-bot/.traffic_alert_state.json"))
 AVAILABILITY_STATE_FILE = Path(os.getenv("AVAILABILITY_STATE_FILE", "/opt/hetzner-telegram-bot/.cost_optimized_state.json"))
 # Hetzner reports traffic as raw bytes, while the Cloud Console
@@ -151,21 +151,31 @@ def clip(text: str, limit: int = MAX_TEXT) -> str:
     return "\n".join(out) + suffix
 
 
+def cost_monitor_enabled() -> bool:
+    state = read_availability_state()
+    return bool(state.get("enabled", True))
+
+
 def main_text() -> str:
+    enabled = cost_monitor_enabled()
+    monitor_status = "🟢 روشن" if enabled else "🔴 خاموش"
     return (
         "🤖 <b>پنل خصوصی Hetzner</b>\n\n"
         f"📁 پروژه‌ها: <b>{len(PROJECTS)}</b>\n"
         "برای مدیریت، ابتدا پروژه را انتخاب کنید.\n\n"
         "🚨 ترافیک 18 / 19 / 20 TB هر شب بررسی می‌شود.\n"
-        f"💸 موجودی Cost-Optimized هر <b>{CHEAP_CHECK_HOURS:g} ساعت</b> بررسی می‌شود."
+        f"💸 مانیتور Cost-Optimized: <b>{monitor_status}</b> — هر <b>{CHEAP_CHECK_HOURS:g} ساعت</b>"
     )
 
 
 def main_keyboard() -> InlineKeyboardMarkup:
+    enabled = cost_monitor_enabled()
+    toggle_label = "🟢 مانیتور Cost-Optimized: روشن" if enabled else "🔴 مانیتور Cost-Optimized: خاموش"
     return InlineKeyboardMarkup(
         [
             [InlineKeyboardButton("📁 انتخاب پروژه", callback_data="projects")],
             [InlineKeyboardButton("💸 موجودی Cost-Optimized", callback_data="cheap:show")],
+            [InlineKeyboardButton(toggle_label, callback_data="cheap:toggle")],
             [InlineKeyboardButton("📊 ترافیک همه پروژه‌ها", callback_data="traffic:all")],
             [InlineKeyboardButton("ℹ️ راهنما", callback_data="help")],
         ]
@@ -392,13 +402,19 @@ def cost_optimized_matrix(server_types: list) -> dict[str, list]:
 
 
 def cost_optimized_text(matrix: dict[str, list], *, title: str = "💸 موجودی Cost-Optimized") -> str:
-    lines = [f"<b>{title}</b>", ""]
+    enabled = cost_monitor_enabled()
+    monitor_status = "🟢 روشن" if enabled else "🔴 خاموش"
+    lines = [f"<b>{title}</b>", f"مانیتور خودکار: <b>{monitor_status}</b>", ""]
     if not matrix:
         lines.extend(
             [
                 "در حال حاضر هیچ پلن Cost-Optimized قابل سفارشی از طریق API گزارش نشده است.",
                 "",
-                f"ربات هر <b>{CHEAP_CHECK_HOURS:g} ساعت</b> دوباره بررسی می‌کند.",
+                (
+                    f"🔄 بررسی خودکار: هر <b>{CHEAP_CHECK_HOURS:g} ساعت</b>"
+                    if enabled
+                    else "⏸ بررسی خودکار در حال حاضر <b>خاموش</b> است."
+                ),
             ]
         )
         return "\n".join(lines)
@@ -413,7 +429,11 @@ def cost_optimized_text(matrix: dict[str, list], *, title: str = "💸 موجو�
     lines.extend(
         [
             "⚠️ موجودی API یک شاخص لحظه‌ای است و Hetzner تضمین نمی‌کند مرحله نهایی Allocation همیشه موفق شود.",
-            f"🔄 بررسی خودکار: هر <b>{CHEAP_CHECK_HOURS:g} ساعت</b>",
+            (
+                f"🔄 بررسی خودکار: هر <b>{CHEAP_CHECK_HOURS:g} ساعت</b>"
+                if enabled
+                else "⏸ بررسی خودکار در حال حاضر <b>خاموش</b> است."
+            ),
         ]
     )
     return "\n".join(lines)
@@ -433,17 +453,38 @@ async def fetch_cost_optimized_matrix() -> tuple[dict, dict[str, list]]:
 
 async def show_cost_optimized(query) -> None:
     _, matrix = await fetch_cost_optimized_matrix()
+    enabled = cost_monitor_enabled()
+    toggle_label = "⏸ خاموش کردن مانیتور" if enabled else "▶️ روشن کردن مانیتور"
     await safe_edit(
         query,
         cost_optimized_text(matrix),
         InlineKeyboardMarkup(
             [
                 [InlineKeyboardButton("🔄 بررسی دوباره", callback_data="cheap:show")],
+                [InlineKeyboardButton(toggle_label, callback_data="cheap:toggle")],
                 [InlineKeyboardButton("📁 انتخاب پروژه برای ساخت", callback_data="projects")],
                 [InlineKeyboardButton("⬅️ منوی اصلی", callback_data="main")],
             ]
         ),
     )
+
+
+async def toggle_cost_optimized_monitor(query) -> None:
+    state = read_availability_state()
+    enabled = not bool(state.get("enabled", True))
+    state["enabled"] = enabled
+    state["updated_at"] = datetime.now(ZoneInfo(BOT_TIMEZONE)).isoformat()
+    write_availability_state(state)
+    await query.answer("مانیتور Cost-Optimized روشن شد ✅" if enabled else "مانیتور Cost-Optimized خاموش شد ⏸")
+    try:
+        await show_cost_optimized(query)
+    except Exception:
+        status = "🟢 روشن" if enabled else "🔴 خاموش"
+        await safe_edit(
+            query,
+            f"💸 <b>مانیتور Cost-Optimized</b>\n\nوضعیت: <b>{status}</b>\nبررسی خودکار: هر <b>{CHEAP_CHECK_HOURS:g} ساعت</b>",
+            InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ منوی اصلی", callback_data="main")]]),
+        )
 
 
 def valid_server_name(name: str) -> bool:
@@ -1326,7 +1367,7 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 "• بعد از اتصال، دستور Linux برای افزودن IP نمایش داده می‌شود.\n"
                 "• Rescale فقط روی سرور خاموش انجام می‌شود.\n"
                 "• ساخت و حذف سرور از داخل هر پروژه انجام می‌شود؛ برای ساخت، نام را تایپ و بقیه گزینه‌ها را با دکمه انتخاب می‌کنید.\n"
-                f"• موجودی Cost-Optimized هر {CHEAP_CHECK_HOURS:g} ساعت بررسی و در صورت موجودشدن اطلاع داده می‌شود.\n"
+                f"• مانیتور Cost-Optimized هر {CHEAP_CHECK_HOURS:g} ساعت بررسی می‌کند و از داخل ربات قابل روشن/خاموش کردن است.\n"
                 "• هشدار 18/19/20 TB هر شب فقط یک بار در روز ارسال می‌شود.",
                 InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ منوی اصلی", callback_data="main")]]),
             )
@@ -1334,6 +1375,9 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if data == "cheap:show":
             await query.answer("در حال بررسی موجودی...")
             await show_cost_optimized(query)
+            return
+        if data == "cheap:toggle":
+            await toggle_cost_optimized_monitor(query)
             return
         if data.startswith("project:"):
             await query.answer()
@@ -2307,7 +2351,7 @@ def availability_pairs(matrix: dict[str, list]) -> list[str]:
 
 
 async def cost_optimized_availability_job(context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not ALLOWED_USER_ID:
+    if not ALLOWED_USER_ID or not cost_monitor_enabled():
         return
     try:
         _, matrix = await fetch_cost_optimized_matrix()
