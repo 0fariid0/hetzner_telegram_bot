@@ -4,6 +4,7 @@ import base64
 import json
 import logging
 import os
+import re
 from datetime import datetime, time
 from html import escape
 from pathlib import Path
@@ -11,6 +12,7 @@ from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
 from hcloud import Client
+from hcloud.servers import ServerCreatePublicNetwork
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
 from telegram.error import BadRequest
@@ -33,7 +35,9 @@ PROJECTS_B64 = os.getenv("HETZNER_PROJECTS_B64", "").strip()
 BOT_TIMEZONE = os.getenv("BOT_TIMEZONE", "Asia/Tehran").strip() or "Asia/Tehran"
 TRAFFIC_CHECK_TIME = os.getenv("TRAFFIC_CHECK_TIME", "23:30").strip() or "23:30"
 TRAFFIC_ALERT_TB = (18.0, 19.0, 20.0)
+CHEAP_CHECK_HOURS = float(os.getenv("CHEAP_CHECK_HOURS", "3") or 3)
 STATE_FILE = Path(os.getenv("STATE_FILE", "/opt/hetzner-telegram-bot/.traffic_alert_state.json"))
+AVAILABILITY_STATE_FILE = Path(os.getenv("AVAILABILITY_STATE_FILE", "/opt/hetzner-telegram-bot/.cost_optimized_state.json"))
 # Hetzner reports traffic as raw bytes, while the Cloud Console
 # presents its traffic quota in 1024-based "TB" units (20 TB = 20 * 1024^4 bytes).
 # Using 10^12 here makes a 20 TB quota appear as ~21.99 TB.
@@ -152,7 +156,8 @@ def main_text() -> str:
         "🤖 <b>پنل خصوصی Hetzner</b>\n\n"
         f"📁 پروژه‌ها: <b>{len(PROJECTS)}</b>\n"
         "برای مدیریت، ابتدا پروژه را انتخاب کنید.\n\n"
-        "🚨 بررسی ترافیک 18 / 19 / 20 TB هر شب به‌صورت خودکار انجام می‌شود."
+        "🚨 ترافیک 18 / 19 / 20 TB هر شب بررسی می‌شود.\n"
+        f"💸 موجودی Cost-Optimized هر <b>{CHEAP_CHECK_HOURS:g} ساعت</b> بررسی می‌شود."
     )
 
 
@@ -160,6 +165,7 @@ def main_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
             [InlineKeyboardButton("📁 انتخاب پروژه", callback_data="projects")],
+            [InlineKeyboardButton("💸 موجودی Cost-Optimized", callback_data="cheap:show")],
             [InlineKeyboardButton("📊 ترافیک همه پروژه‌ها", callback_data="traffic:all")],
             [InlineKeyboardButton("ℹ️ راهنما", callback_data="help")],
         ]
@@ -222,6 +228,7 @@ def server_keyboard(pidx: int, server) -> InlineKeyboardMarkup:
             *primary_rows,
             [InlineKeyboardButton("📦 Primary IPv4های پروژه", callback_data=f"pips:{pidx}")],
             [InlineKeyboardButton("🌐 Floating IPهای سرور", callback_data=f"srv:fips:{pidx}:{sid}")],
+            [InlineKeyboardButton("🗑 حذف سرور", callback_data=f"srv:askdelete:{pidx}:{sid}")],
             [InlineKeyboardButton("🔄 بروزرسانی", callback_data=f"srv:refresh:{pidx}:{sid}")],
             [InlineKeyboardButton("⬅️ برگشت به پروژه", callback_data=f"project:{pidx}")],
         ]
@@ -325,6 +332,227 @@ async def fetch_project_data(pidx: int):
     return project, servers, fips
 
 
+
+def is_cost_optimized_server_type(server_type) -> bool:
+    """Match Hetzner's cost-optimized families without relying on a single category string."""
+    name = str(getattr(server_type, "name", "") or "").lower()
+    category = str(getattr(server_type, "category", "") or "").lower().replace("_", "-")
+    if "cost" in category and ("optim" in category or "optimized" in category):
+        return True
+    # Current Cost-Optimized families are CX (x86) and CAX (Arm64).
+    return bool(re.match(r"^(cx|cax)\d+$", name))
+
+
+def server_type_location_entry(server_type, location_name: str):
+    for entry in getattr(server_type, "locations", None) or []:
+        loc = getattr(entry, "location", None)
+        if getattr(loc, "name", None) == location_name:
+            return entry
+    return None
+
+
+def available_server_types_in_location(server_types: list, location_name: str) -> list:
+    available = []
+    for st in server_types:
+        entry = server_type_location_entry(st, location_name)
+        if not entry or getattr(entry, "available", None) is not True:
+            continue
+        if getattr(entry, "deprecation", None) is not None:
+            continue
+        available.append(st)
+    return sorted(
+        available,
+        key=lambda st: (
+            0 if is_cost_optimized_server_type(st) else 1,
+            getattr(st, "memory", 0) or 0,
+            getattr(st, "cores", 0) or 0,
+            str(getattr(st, "name", "")),
+        ),
+    )
+
+
+def cost_optimized_matrix(server_types: list) -> dict[str, list]:
+    matrix: dict[str, list] = {}
+    for st in server_types:
+        if not is_cost_optimized_server_type(st):
+            continue
+        for entry in getattr(st, "locations", None) or []:
+            if getattr(entry, "available", None) is not True:
+                continue
+            if getattr(entry, "deprecation", None) is not None:
+                continue
+            loc = getattr(entry, "location", None)
+            loc_name = getattr(loc, "name", None)
+            if not loc_name:
+                continue
+            matrix.setdefault(loc_name, []).append(st)
+    for loc_name in matrix:
+        matrix[loc_name].sort(key=lambda st: (getattr(st, "memory", 0) or 0, getattr(st, "cores", 0) or 0, st.name))
+    return dict(sorted(matrix.items()))
+
+
+def cost_optimized_text(matrix: dict[str, list], *, title: str = "💸 موجودی Cost-Optimized") -> str:
+    lines = [f"<b>{title}</b>", ""]
+    if not matrix:
+        lines.extend(
+            [
+                "در حال حاضر هیچ پلن Cost-Optimized قابل سفارشی از طریق API گزارش نشده است.",
+                "",
+                f"ربات هر <b>{CHEAP_CHECK_HOURS:g} ساعت</b> دوباره بررسی می‌کند.",
+            ]
+        )
+        return "\n".join(lines)
+    for loc_name, plans in matrix.items():
+        lines.append(f"📍 <b>{escape(loc_name)}</b>")
+        for st in plans:
+            arch = "ARM" if getattr(st, "architecture", "") == "arm" else "x86"
+            lines.append(
+                f"• <code>{escape(st.name)}</code> — {st.cores} vCPU / {st.memory:g} GB / {st.disk} GB — {arch}"
+            )
+        lines.append("")
+    lines.extend(
+        [
+            "⚠️ موجودی API یک شاخص لحظه‌ای است و Hetzner تضمین نمی‌کند مرحله نهایی Allocation همیشه موفق شود.",
+            f"🔄 بررسی خودکار: هر <b>{CHEAP_CHECK_HOURS:g} ساعت</b>",
+        ]
+    )
+    return "\n".join(lines)
+
+
+async def fetch_cost_optimized_matrix() -> tuple[dict, dict[str, list]]:
+    last_exc = None
+    for project in PROJECTS:
+        try:
+            server_types = await asyncio.to_thread(project["client"].server_types.get_all)
+            return project, cost_optimized_matrix(server_types)
+        except Exception as exc:
+            last_exc = exc
+            log.exception("Cost-Optimized availability check failed for project %s", project["name"])
+    raise RuntimeError(f"هیچ توکن فعالی برای بررسی موجودی پاسخ نداد: {last_exc}")
+
+
+async def show_cost_optimized(query) -> None:
+    _, matrix = await fetch_cost_optimized_matrix()
+    await safe_edit(
+        query,
+        cost_optimized_text(matrix),
+        InlineKeyboardMarkup(
+            [
+                [InlineKeyboardButton("🔄 بررسی دوباره", callback_data="cheap:show")],
+                [InlineKeyboardButton("📁 انتخاب پروژه برای ساخت", callback_data="projects")],
+                [InlineKeyboardButton("⬅️ منوی اصلی", callback_data="main")],
+            ]
+        ),
+    )
+
+
+def valid_server_name(name: str) -> bool:
+    if not 1 <= len(name) <= 63:
+        return False
+    return bool(re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", name))
+
+
+def latest_ubuntu_image(images: list):
+    candidates = []
+    for image in images:
+        name = str(getattr(image, "name", "") or "")
+        if not name.startswith("ubuntu-"):
+            continue
+        if getattr(image, "status", "available") not in (None, "available"):
+            continue
+        m = re.fullmatch(r"ubuntu-(\d+)\.(\d+)", name)
+        if not m:
+            continue
+        candidates.append(((int(m.group(1)), int(m.group(2))), image))
+    return max(candidates, key=lambda x: x[0])[1] if candidates else None
+
+
+def server_create_summary(project: dict, pending: dict, location, server_type, image, ipv6: bool) -> str:
+    cost_tag = "💸 Cost-Optimized" if is_cost_optimized_server_type(server_type) else "☁️ Cloud"
+    return (
+        f"➕ <b>تأیید ساخت سرور — {escape(project['name'])}</b>\n\n"
+        f"نام: <code>{escape(pending['name'])}</code>\n"
+        f"Location: <code>{escape(location.name)}</code> — {escape(str(getattr(location, 'city', '') or ''))}\n"
+        f"پلن: <code>{escape(server_type.name)}</code> — {server_type.cores} vCPU / {server_type.memory:g} GB RAM / {server_type.disk} GB\n"
+        f"نوع: {cost_tag}\n"
+        f"معماری: <code>{escape(str(server_type.architecture))}</code>\n"
+        f"سیستم‌عامل: <code>{escape(image.name)}</code>\n"
+        f"IPv4: ✅ فعال\n"
+        f"IPv6: {'✅ فعال' if ipv6 else '❌ غیرفعال'}\n\n"
+        "با تأیید، سرور ساخته و روشن می‌شود."
+    )
+
+
+async def show_create_locations(query, context: ContextTypes.DEFAULT_TYPE, pidx: int) -> None:
+    project = get_project(pidx)
+    if not project:
+        await query.answer("پروژه پیدا نشد.", show_alert=True)
+        return
+    locations = await asyncio.to_thread(project["client"].locations.get_all)
+    pending = context.user_data.get("server_create", {})
+    if not pending.get("name"):
+        await query.answer("فرآیند ساخت منقضی شده؛ دوباره شروع کنید.", show_alert=True)
+        return
+    rows = [
+        [InlineKeyboardButton(f"📍 {loc.name} — {loc.city}", callback_data=f"newsv:loc:{pidx}:{loc.id}")]
+        for loc in locations
+    ]
+    rows.append([InlineKeyboardButton("⬅️ انصراف", callback_data=f"project:{pidx}")])
+    await safe_edit(
+        query,
+        f"➕ <b>ساخت سرور</b>\n\nنام: <code>{escape(pending['name'])}</code>\n\nLocation را انتخاب کنید:",
+        InlineKeyboardMarkup(rows),
+    )
+
+
+async def show_create_plans(query, context: ContextTypes.DEFAULT_TYPE, pidx: int, location_id: int) -> None:
+    project = get_project(pidx)
+    if not project:
+        await query.answer("پروژه پیدا نشد.", show_alert=True)
+        return
+    client = project["client"]
+    location, server_types = await asyncio.gather(
+        asyncio.to_thread(client.locations.get_by_id, location_id),
+        asyncio.to_thread(client.server_types.get_all),
+    )
+    if not location:
+        await query.answer("Location پیدا نشد.", show_alert=True)
+        return
+    plans = available_server_types_in_location(server_types, location.name)
+    pending = context.user_data.get("server_create", {})
+    pending.update({"project": pidx, "location_id": location_id, "location_name": location.name})
+    context.user_data["server_create"] = pending
+    if not plans:
+        await safe_edit(
+            query,
+            f"📍 <b>{escape(location.name)}</b>\n\n❌ در حال حاضر پلن قابل سفارشی برای این Location گزارش نشده است.",
+            InlineKeyboardMarkup(
+                [
+                    [InlineKeyboardButton("🔄 دوباره بررسی کن", callback_data=f"newsv:loc:{pidx}:{location_id}")],
+                    [InlineKeyboardButton("⬅️ Locationها", callback_data=f"newsv:locations:{pidx}")],
+                ]
+            ),
+        )
+        return
+    rows = []
+    buttons = []
+    for st in plans:
+        marker = "💸" if is_cost_optimized_server_type(st) else "☁️"
+        buttons.append(
+            InlineKeyboardButton(
+                f"{marker} {st.name} | {st.cores}C/{st.memory:g}G",
+                callback_data=f"newsv:plan:{pidx}:{st.id}",
+            )
+        )
+    for i in range(0, len(buttons), 2):
+        rows.append(buttons[i:i+2])
+    rows.append([InlineKeyboardButton("⬅️ Locationها", callback_data=f"newsv:locations:{pidx}")])
+    await safe_edit(
+        query,
+        f"📍 <b>{escape(location.name)}</b>\n\nپلن را انتخاب کنید. فقط پلن‌هایی که Hetzner همین حالا Available گزارش می‌کند نمایش داده شده‌اند:\n\n💸 = Cost-Optimized",
+        InlineKeyboardMarkup(rows),
+    )
+
 def project_dashboard_text(project: dict, servers: list, fips: list) -> str:
     lines = [
         f"📁 <b>{escape(project['name'])}</b>",
@@ -356,6 +584,7 @@ def project_dashboard_keyboard(pidx: int, servers: list) -> InlineKeyboardMarkup
         rows.append(buttons[i : i + 2])
     rows.extend(
         [
+            [InlineKeyboardButton("➕ ساخت سرور", callback_data=f"newsv:start:{pidx}")],
             [
                 InlineKeyboardButton("📦 Primary IPv4", callback_data=f"pips:{pidx}"),
                 InlineKeyboardButton("🌐 Floating IP", callback_data=f"fips:{pidx}"),
@@ -1056,6 +1285,7 @@ async def show_fip_server_choices(query, pidx: int, fip_id: int) -> None:
 async def clear_text_flow(context: ContextTypes.DEFAULT_TYPE) -> None:
     context.user_data.pop("awaiting_text", None)
     context.user_data.pop("fip_create", None)
+    context.user_data.pop("server_create", None)
     context.user_data.pop("panel_chat_id", None)
     context.user_data.pop("panel_message_id", None)
 
@@ -1095,9 +1325,15 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 "• Floating IP را می‌توانید بسازید، متصل، منتقل، جدا و حذف کنید.\n"
                 "• بعد از اتصال، دستور Linux برای افزودن IP نمایش داده می‌شود.\n"
                 "• Rescale فقط روی سرور خاموش انجام می‌شود.\n"
+                "• ساخت و حذف سرور از داخل هر پروژه انجام می‌شود؛ برای ساخت، نام را تایپ و بقیه گزینه‌ها را با دکمه انتخاب می‌کنید.\n"
+                f"• موجودی Cost-Optimized هر {CHEAP_CHECK_HOURS:g} ساعت بررسی و در صورت موجودشدن اطلاع داده می‌شود.\n"
                 "• هشدار 18/19/20 TB هر شب فقط یک بار در روز ارسال می‌شود.",
                 InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ منوی اصلی", callback_data="main")]]),
             )
+            return
+        if data == "cheap:show":
+            await query.answer("در حال بررسی موجودی...")
+            await show_cost_optimized(query)
             return
         if data.startswith("project:"):
             await query.answer()
@@ -1198,6 +1434,38 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             elif action == "fips":
                 await query.answer()
                 await show_server_fips(query, pidx, sid)
+            elif action == "askdelete":
+                await query.answer()
+                await safe_edit(
+                    query,
+                    f"⚠️ <b>حذف کامل سرور</b>\n\n"
+                    f"سرور: <b>{escape(server.name)}</b>\n"
+                    f"Location: <code>{escape(server_location(server))}</code>\n"
+                    f"پلن: <code>{escape(server.server_type.name)}</code>\n\n"
+                    "تمام اطلاعات روی دیسک این سرور برای همیشه حذف می‌شود. این عملیات قابل بازگشت نیست.\n\n"
+                    "مطمئن هستید؟",
+                    InlineKeyboardMarkup(
+                        [
+                            [InlineKeyboardButton("🗑 بله، سرور حذف شود", callback_data=f"srv:delete:{pidx}:{sid}")],
+                            [InlineKeyboardButton("⬅️ انصراف", callback_data=f"srv:open:{pidx}:{sid}")],
+                        ]
+                    ),
+                )
+            elif action == "delete":
+                server_name = server.name
+                await query.answer("در حال حذف سرور...")
+                await safe_edit(
+                    query,
+                    f"🗑 <b>در حال حذف سرور</b>\n\n<b>{escape(server_name)}</b>\nلطفاً صبر کنید...",
+                )
+                act = await asyncio.to_thread(server.delete)
+                await asyncio.to_thread(act.wait_until_finished)
+                project_obj, servers, fips = await fetch_project_data(pidx)
+                await safe_edit(
+                    query,
+                    f"✅ سرور <b>{escape(server_name)}</b> حذف شد.\n\n" + project_dashboard_text(project_obj, servers, fips),
+                    project_dashboard_keyboard(pidx, servers),
+                )
             return
 
         if kind == "pip":
@@ -1266,6 +1534,185 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             elif action == "newswap":
                 pidx, sid = int(parts[2]), int(parts[3])
                 await perform_primary_ipv4_swap(query, pidx, sid, None)
+            return
+
+        if kind == "newsv":
+            action = parts[1]
+            pidx = int(parts[2])
+            project = get_project(pidx)
+            if not project:
+                await query.answer("پروژه پیدا نشد.", show_alert=True)
+                return
+            client = project["client"]
+
+            if action == "start":
+                context.user_data["server_create"] = {"project": pidx}
+                context.user_data["awaiting_text"] = "server_name"
+                context.user_data["panel_chat_id"] = query.message.chat_id
+                context.user_data["panel_message_id"] = query.message.message_id
+                await query.answer()
+                await safe_edit(
+                    query,
+                    f"➕ <b>ساخت سرور — {escape(project['name'])}</b>\n\n"
+                    "اسم سرور را به‌صورت پیام بفرستید.\n"
+                    "فقط حروف انگلیسی کوچک، عدد و خط تیره مجاز است.\n"
+                    "مثال: <code>panel-01</code>\n\n"
+                    "بعد از اسم، بقیه گزینه‌ها با دکمه شیشه‌ای انتخاب می‌شوند.",
+                    InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ انصراف", callback_data=f"project:{pidx}")]]),
+                )
+                return
+
+            if action == "locations":
+                await query.answer()
+                await show_create_locations(query, context, pidx)
+                return
+
+            if action == "loc":
+                location_id = int(parts[3])
+                await query.answer("در حال گرفتن پلن‌های موجود...")
+                await show_create_plans(query, context, pidx, location_id)
+                return
+
+            pending = context.user_data.get("server_create", {})
+            if int(pending.get("project", -1)) != pidx or not pending.get("name"):
+                await query.answer("فرآیند ساخت منقضی شده؛ دوباره شروع کنید.", show_alert=True)
+                return
+
+            if action == "plan":
+                stid = int(parts[3])
+                st = await asyncio.to_thread(client.server_types.get_by_id, stid)
+                location = await asyncio.to_thread(client.locations.get_by_id, int(pending["location_id"]))
+                if not st or not location:
+                    await query.answer("پلن یا Location پیدا نشد.", show_alert=True)
+                    return
+                entry = server_type_location_entry(st, location.name)
+                if not entry or getattr(entry, "available", None) is not True:
+                    await query.answer("این پلن همین حالا در این Location موجود نیست.", show_alert=True)
+                    await show_create_plans(query, context, pidx, location.id)
+                    return
+                pending["server_type_id"] = stid
+                context.user_data["server_create"] = pending
+                await query.answer()
+                await safe_edit(
+                    query,
+                    f"➕ <b>ساخت سرور</b>\n\n"
+                    f"نام: <code>{escape(pending['name'])}</code>\n"
+                    f"Location: <code>{escape(location.name)}</code>\n"
+                    f"پلن: <code>{escape(st.name)}</code> — {st.cores} vCPU / {st.memory:g} GB\n\n"
+                    "IPv6 برای این سرور فعال باشد؟\n\n"
+                    "IPv4 در هر دو حالت فعال است.",
+                    InlineKeyboardMarkup(
+                        [
+                            [
+                                InlineKeyboardButton("✅ با IPv6", callback_data=f"newsv:ip6on:{pidx}"),
+                                InlineKeyboardButton("❌ بدون IPv6", callback_data=f"newsv:ip6off:{pidx}"),
+                            ],
+                            [InlineKeyboardButton("⬅️ پلن‌ها", callback_data=f"newsv:loc:{pidx}:{location.id}")],
+                        ]
+                    ),
+                )
+                return
+
+            if action in {"ip6on", "ip6off"}:
+                ipv6 = action == "ip6on"
+                pending["ipv6"] = ipv6
+                st = await asyncio.to_thread(client.server_types.get_by_id, int(pending["server_type_id"]))
+                location = await asyncio.to_thread(client.locations.get_by_id, int(pending["location_id"]))
+                images = await asyncio.to_thread(
+                    client.images.get_all,
+                    type=["system"],
+                    architecture=[st.architecture],
+                    include_deprecated=False,
+                )
+                image = latest_ubuntu_image(images)
+                if not image:
+                    await query.answer("Ubuntu سازگار با این معماری پیدا نشد.", show_alert=True)
+                    return
+                pending["image_id"] = image.id
+                context.user_data["server_create"] = pending
+                await query.answer()
+                await safe_edit(
+                    query,
+                    server_create_summary(project, pending, location, st, image, ipv6),
+                    InlineKeyboardMarkup(
+                        [
+                            [InlineKeyboardButton("✅ ساخت سرور", callback_data=f"newsv:create:{pidx}")],
+                            [InlineKeyboardButton("⬅️ تغییر IPv6", callback_data=f"newsv:plan:{pidx}:{st.id}")],
+                            [InlineKeyboardButton("❌ انصراف", callback_data=f"project:{pidx}")],
+                        ]
+                    ),
+                )
+                return
+
+            if action == "create":
+                st = await asyncio.to_thread(client.server_types.get_by_id, int(pending["server_type_id"]))
+                location = await asyncio.to_thread(client.locations.get_by_id, int(pending["location_id"]))
+                image = await asyncio.to_thread(client.images.get_by_id, int(pending["image_id"]))
+                entry = server_type_location_entry(st, location.name) if st else None
+                if not st or not location or not image:
+                    await query.answer("اطلاعات ساخت ناقص است؛ دوباره شروع کنید.", show_alert=True)
+                    return
+                if not entry or getattr(entry, "available", None) is not True:
+                    await query.answer("موجودی این پلن تمام شده؛ یک پلن دیگر انتخاب کنید.", show_alert=True)
+                    await show_create_plans(query, context, pidx, location.id)
+                    return
+                await query.answer("در حال ساخت سرور...")
+                await safe_edit(
+                    query,
+                    f"⏳ <b>در حال ساخت سرور</b>\n\n"
+                    f"نام: <code>{escape(pending['name'])}</code>\n"
+                    f"پلن: <code>{escape(st.name)}</code>\n"
+                    f"Location: <code>{escape(location.name)}</code>\n\n"
+                    "لطفاً صبر کنید؛ Allocation نهایی ممکن است کمی زمان ببرد.",
+                )
+                try:
+                    response = await asyncio.to_thread(
+                        client.servers.create,
+                        name=pending["name"],
+                        server_type=st,
+                        image=image,
+                        location=location,
+                        start_after_create=True,
+                        public_net=ServerCreatePublicNetwork(
+                            enable_ipv4=True,
+                            enable_ipv6=bool(pending.get("ipv6", True)),
+                        ),
+                    )
+                    await asyncio.to_thread(response.action.wait_until_finished)
+                    for next_action in getattr(response, "next_actions", []) or []:
+                        await asyncio.to_thread(next_action.wait_until_finished)
+                    server = await asyncio.to_thread(client.servers.get_by_id, response.server.id)
+                    if not server:
+                        raise RuntimeError("سرور بعد از ساخت در API پیدا نشد")
+                except Exception as exc:
+                    log.exception("Server creation/allocation failed")
+                    await safe_edit(
+                        query,
+                        f"❌ <b>ساخت سرور ناموفق بود.</b>\n\n"
+                        f"Hetzner ممکن است بین Availability اولیه و Allocation نهایی ظرفیتش تمام شده باشد.\n\n"
+                        f"<code>{escape(str(exc))}</code>",
+                        InlineKeyboardMarkup(
+                            [
+                                [InlineKeyboardButton("🔄 انتخاب دوباره پلن", callback_data=f"newsv:loc:{pidx}:{location.id}")],
+                                [InlineKeyboardButton("⬅️ برگشت به پروژه", callback_data=f"project:{pidx}")],
+                            ]
+                        ),
+                    )
+                    return
+                root_password = getattr(response, "root_password", None)
+                context.user_data.pop("server_create", None)
+                context.user_data.pop("panel_chat_id", None)
+                context.user_data.pop("panel_message_id", None)
+                text = "✅ <b>سرور با موفقیت ساخته شد.</b>\n\n" + server_text(server, project["name"])
+                if root_password:
+                    text += (
+                        "\n\n🔐 <b>رمز root — فقط همین بار نمایش داده می‌شود:</b>\n"
+                        f"<code>{escape(root_password)}</code>"
+                    )
+                await safe_edit(query, text, server_keyboard(pidx, server))
+                return
+
+            await query.answer("درخواست ساخت نامعتبر است.", show_alert=True)
             return
 
         if kind == "rzt":
@@ -1504,11 +1951,88 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if not authorized(update):
         await deny(update)
         return
-    if context.user_data.get("awaiting_text") != "fip_name":
+    awaiting = context.user_data.get("awaiting_text")
+    if awaiting not in {"fip_name", "server_name"}:
         return
-    pending = context.user_data.get("fip_create", {})
     message = update.effective_message
     name = (message.text or "").strip()
+
+    if awaiting == "server_name":
+        pending = context.user_data.get("server_create", {})
+        pidx = int(pending.get("project", -1))
+        project = get_project(pidx)
+        chat_id = context.user_data.get("panel_chat_id")
+        message_id = context.user_data.get("panel_message_id")
+        normalized = name.lower()
+        try:
+            await message.delete()
+        except Exception:
+            pass
+        if not project or not valid_server_name(normalized):
+            if chat_id and message_id and project:
+                try:
+                    await context.bot.edit_message_text(
+                        chat_id=chat_id,
+                        message_id=message_id,
+                        text=(
+                            "❌ نام سرور معتبر نیست.\n\n"
+                            "فقط حروف انگلیسی کوچک، عدد و خط تیره مجاز است؛ نام نباید با خط تیره شروع یا تمام شود.\n"
+                            "مثال: <code>panel-01</code>\n\n"
+                            "نام را دوباره بفرستید."
+                        ),
+                        parse_mode=ParseMode.HTML,
+                        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ انصراف", callback_data=f"project:{pidx}")]]),
+                    )
+                except Exception:
+                    pass
+            return
+        try:
+            existing = await asyncio.to_thread(project["client"].servers.get_by_name, normalized)
+            if existing:
+                if chat_id and message_id:
+                    await context.bot.edit_message_text(
+                        chat_id=chat_id,
+                        message_id=message_id,
+                        text=f"❌ سروری با نام <code>{escape(normalized)}</code> از قبل وجود دارد.\n\nنام دیگری بفرستید.",
+                        parse_mode=ParseMode.HTML,
+                        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ انصراف", callback_data=f"project:{pidx}")]]),
+                    )
+                return
+            pending["name"] = normalized
+            context.user_data["server_create"] = pending
+            context.user_data.pop("awaiting_text", None)
+            locations = await asyncio.to_thread(project["client"].locations.get_all)
+            rows = [
+                [InlineKeyboardButton(f"📍 {loc.name} — {loc.city}", callback_data=f"newsv:loc:{pidx}:{loc.id}")]
+                for loc in locations
+            ]
+            rows.append([InlineKeyboardButton("⬅️ انصراف", callback_data=f"project:{pidx}")])
+            if chat_id and message_id:
+                await context.bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    text=f"➕ <b>ساخت سرور</b>\n\nنام: <code>{escape(normalized)}</code>\n\nLocation را انتخاب کنید:",
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=InlineKeyboardMarkup(rows),
+                )
+            return
+        except Exception as exc:
+            log.exception("Server create name flow failed")
+            if chat_id and message_id:
+                try:
+                    await context.bot.edit_message_text(
+                        chat_id=chat_id,
+                        message_id=message_id,
+                        text=f"❌ خطا در آماده‌سازی ساخت سرور:\n<code>{escape(str(exc))}</code>",
+                        parse_mode=ParseMode.HTML,
+                        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ برگشت", callback_data=f"project:{pidx}")]]),
+                    )
+                except Exception:
+                    pass
+            await clear_text_flow(context)
+            return
+
+    pending = context.user_data.get("fip_create", {})
     if not name or len(name) > 64:
         chat_id = context.user_data.get("panel_chat_id")
         message_id = context.user_data.get("panel_message_id")
@@ -1758,6 +2282,60 @@ async def traffic_alert_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         write_alert_state(state)
 
 
+
+def read_availability_state() -> dict:
+    try:
+        if AVAILABILITY_STATE_FILE.exists():
+            return json.loads(AVAILABILITY_STATE_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        log.exception("Could not read Cost-Optimized availability state")
+    return {}
+
+
+def write_availability_state(state: dict) -> None:
+    try:
+        AVAILABILITY_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = AVAILABILITY_STATE_FILE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
+        tmp.replace(AVAILABILITY_STATE_FILE)
+    except Exception:
+        log.exception("Could not write Cost-Optimized availability state")
+
+
+def availability_pairs(matrix: dict[str, list]) -> list[str]:
+    return sorted(f"{loc}|{st.name}" for loc, plans in matrix.items() for st in plans)
+
+
+async def cost_optimized_availability_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not ALLOWED_USER_ID:
+        return
+    try:
+        _, matrix = await fetch_cost_optimized_matrix()
+    except Exception:
+        log.exception("Cost-Optimized availability job failed")
+        return
+    current = availability_pairs(matrix)
+    state = read_availability_state()
+    previous = set(state.get("available_pairs", []))
+    new_pairs = set(current) - previous
+    state["available_pairs"] = current
+    state["last_checked_at"] = datetime.now(ZoneInfo(BOT_TIMEZONE)).isoformat()
+    write_availability_state(state)
+    if not new_pairs:
+        return
+    text = cost_optimized_text(matrix, title="🔔 Cost-Optimized موجود شد")
+    text += "\n\n<b>موجودی جدید:</b>\n" + "\n".join(
+        f"• <code>{escape(pair.split('|', 1)[1])}</code> در <code>{escape(pair.split('|', 1)[0])}</code>"
+        for pair in sorted(new_pairs)
+    )
+    await context.bot.send_message(
+        chat_id=int(ALLOWED_USER_ID),
+        text=clip(text),
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📁 انتخاب پروژه برای ساخت", callback_data="projects")]]),
+    )
+
+
 def parse_job_time() -> time:
     try:
         hour, minute = [int(x) for x in TRAFFIC_CHECK_TIME.split(":", 1)]
@@ -1774,6 +2352,8 @@ def validate_config() -> None:
         missing.append("ALLOWED_USER_ID (numeric)")
     if not PROJECTS:
         missing.append("HETZNER_PROJECTS_B64 or HETZNER_API_TOKEN")
+    if CHEAP_CHECK_HOURS <= 0:
+        missing.append("CHEAP_CHECK_HOURS (> 0)")
     if missing:
         raise SystemExit("Missing/invalid configuration: " + ", ".join(missing))
 
@@ -1792,5 +2372,11 @@ if __name__ == "__main__":
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
     app.job_queue.run_daily(traffic_alert_job, time=parse_job_time(), name="nightly-traffic-alert")
+    app.job_queue.run_repeating(
+        cost_optimized_availability_job,
+        interval=CHEAP_CHECK_HOURS * 3600,
+        first=30,
+        name="cost-optimized-availability",
+    )
     print(f"Hetzner Telegram Bot is running with {len(PROJECTS)} project(s)...")
     app.run_polling(drop_pending_updates=True)
