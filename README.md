@@ -33,6 +33,7 @@ Projects
   ↓
 Selected Project
   ├─ Server buttons
+  ├─ Primary IPv4
   ├─ Floating IP
   └─ Traffic
 ```
@@ -71,9 +72,28 @@ Selected Project
 - Power On
 - Shutdown امن
 - Refresh
-- مدیریت Primary IPv4
+- تعویض خودکار Primary IPv4
+- مشاهده و حذف Primary IPv4های آزاد پروژه
 - مدیریت Floating IPهای متصل به همان سرور
 - تغییر Server Type / Resize
+
+## 🔁 تعویض خودکار Primary IPv4
+
+در صفحه هر سرور دکمه **تعویض Primary IPv4** وجود دارد.
+
+می‌توانید یکی از IPv4های آزاد همان Location را انتخاب کنید یا از ربات بخواهید یک IPv4 جدید بسازد. روند تعویض به‌صورت خودکار انجام می‌شود:
+
+1. ارسال Shutdown امن به سرور
+2. انتظار تا وضعیت سرور در Hetzner به `off` برسد
+3. Unassign کردن Primary IPv4 فعلی
+4. Assign کردن IPv4 جدید
+5. روشن کردن دوباره سرور و انتظار برای `running`
+
+Primary IPv4 قبلی **حذف نمی‌شود** و بعد از تعویض به حالت آزاد در پروژه باقی می‌ماند. از بخش `Primary IPv4` در داشبورد پروژه می‌توانید تمام IPv4های موجود را ببینید و IPهای آزاد را با تأیید نهایی حذف کنید.
+
+اگر اتصال IP جدید در میانه عملیات خطا بدهد، ربات تلاش می‌کند IP قبلی را دوباره به سرور متصل کند و سرور را روشن کند.
+
+> Hetzner برای Assign/Unassign کردن Primary IP روی سرور موجود، نیاز دارد وضعیت سرور `off` باشد.
 
 ## ⚙️ Resize
 

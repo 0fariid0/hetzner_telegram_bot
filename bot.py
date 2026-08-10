@@ -196,11 +196,19 @@ def server_text(server, project_name: str) -> str:
 
 def server_keyboard(pidx: int, server) -> InlineKeyboardMarkup:
     sid = server.id
-    primary_button = (
-        InlineKeyboardButton("🗑 حذف Primary IPv4", callback_data=f"srv:askpip:{pidx}:{sid}")
-        if server_ipv4(server)
-        else InlineKeyboardButton("➕ اتصال Primary IPv4 آزاد", callback_data=f"srv:assignpip:{pidx}:{sid}")
-    )
+    has_ipv4 = bool(server_ipv4(server))
+    primary_rows = [
+        [
+            InlineKeyboardButton(
+                "🔁 تعویض Primary IPv4" if has_ipv4 else "➕ افزودن Primary IPv4",
+                callback_data=f"srv:swappip:{pidx}:{sid}",
+            )
+        ]
+    ]
+    if has_ipv4:
+        primary_rows.append(
+            [InlineKeyboardButton("🗑 حذف Primary IPv4", callback_data=f"srv:askpip:{pidx}:{sid}")]
+        )
     return InlineKeyboardMarkup(
         [
             [
@@ -208,7 +216,8 @@ def server_keyboard(pidx: int, server) -> InlineKeyboardMarkup:
                 InlineKeyboardButton("🔴 خاموش", callback_data=f"srv:off:{pidx}:{sid}"),
             ],
             [InlineKeyboardButton("⚙️ تغییر سایز", callback_data=f"srv:resize:{pidx}:{sid}")],
-            [primary_button],
+            *primary_rows,
+            [InlineKeyboardButton("📦 Primary IPv4های پروژه", callback_data=f"pips:{pidx}")],
             [InlineKeyboardButton("🌐 Floating IPهای سرور", callback_data=f"srv:fips:{pidx}:{sid}")],
             [InlineKeyboardButton("🔄 بروزرسانی", callback_data=f"srv:refresh:{pidx}:{sid}")],
             [InlineKeyboardButton("⬅️ برگشت به پروژه", callback_data=f"project:{pidx}")],
@@ -345,9 +354,10 @@ def project_dashboard_keyboard(pidx: int, servers: list) -> InlineKeyboardMarkup
     rows.extend(
         [
             [
+                InlineKeyboardButton("📦 Primary IPv4", callback_data=f"pips:{pidx}"),
                 InlineKeyboardButton("🌐 Floating IP", callback_data=f"fips:{pidx}"),
-                InlineKeyboardButton("📊 ترافیک", callback_data=f"traffic:{pidx}"),
             ],
+            [InlineKeyboardButton("📊 ترافیک", callback_data=f"traffic:{pidx}")],
             [InlineKeyboardButton("🔄 بروزرسانی پروژه", callback_data=f"project:{pidx}")],
             [InlineKeyboardButton("⬅️ پروژه‌ها", callback_data="projects")],
         ]
@@ -416,6 +426,439 @@ async def show_server(query, pidx: int, sid: int, notice: str | None = None) -> 
     if notice:
         text += f"\n\n{notice}"
     await safe_edit(query, text, server_keyboard(pidx, server))
+
+
+
+def primary_ip_location(primary_ip) -> str:
+    location = getattr(primary_ip, "location", None)
+    return getattr(location, "name", None) or "نامشخص"
+
+
+def primary_ipv4_for_server(primary_ips: list, server_id: int):
+    return next(
+        (
+            ip
+            for ip in primary_ips
+            if getattr(ip, "type", None) == "ipv4"
+            and getattr(ip, "assignee_id", None) == server_id
+        ),
+        None,
+    )
+
+
+def primary_ip_name(primary_ip) -> str:
+    return getattr(primary_ip, "name", None) or f"Primary IP #{primary_ip.id}"
+
+
+def primary_ip_list_text(project: dict, primary_ips: list, servers: list) -> str:
+    ipv4s = [ip for ip in primary_ips if getattr(ip, "type", None) == "ipv4"]
+    server_names = {s.id: s.name for s in servers}
+    free_count = sum(1 for ip in ipv4s if getattr(ip, "assignee_id", None) is None)
+    lines = [
+        f"📦 <b>Primary IPv4 — {escape(project['name'])}</b>",
+        f"تعداد: <b>{len(ipv4s)}</b>   |   آزاد: <b>{free_count}</b>",
+        "",
+    ]
+    if not ipv4s:
+        lines.append("هیچ Primary IPv4 در این پروژه وجود ندارد.")
+    else:
+        for idx, ip in enumerate(ipv4s, 1):
+            assignee_id = getattr(ip, "assignee_id", None)
+            if assignee_id is None:
+                state = "🟢 آزاد"
+            else:
+                state = f"🖥 {escape(server_names.get(assignee_id, f'Server #{assignee_id}'))}"
+            lines.append(
+                f"{idx}. <code>{escape(str(ip.ip))}</code> — {state} — "
+                f"<code>{escape(primary_ip_location(ip))}</code>"
+            )
+    lines.extend(
+        [
+            "",
+            "IPهایی که بعد از تعویض از سرور جدا می‌شوند، اینجا به حالت «آزاد» باقی می‌مانند و می‌توانید حذفشان کنید.",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def primary_ip_list_keyboard(pidx: int, primary_ips: list) -> InlineKeyboardMarkup:
+    ipv4s = [ip for ip in primary_ips if getattr(ip, "type", None) == "ipv4"]
+    rows = []
+    for ip in ipv4s[:60]:
+        marker = "🟢" if getattr(ip, "assignee_id", None) is None else "🔗"
+        rows.append(
+            [InlineKeyboardButton(f"{marker} {ip.ip}", callback_data=f"pip:open:{pidx}:{ip.id}")]
+        )
+    rows.extend(
+        [
+            [InlineKeyboardButton("🔄 بروزرسانی", callback_data=f"pips:{pidx}")],
+            [InlineKeyboardButton("⬅️ برگشت به پروژه", callback_data=f"project:{pidx}")],
+        ]
+    )
+    return InlineKeyboardMarkup(rows)
+
+
+async def show_primary_ip_list(query, pidx: int) -> None:
+    project = get_project(pidx)
+    if not project:
+        await query.answer("پروژه پیدا نشد.", show_alert=True)
+        return
+    client = project["client"]
+    primary_ips, servers = await asyncio.gather(
+        asyncio.to_thread(client.primary_ips.get_all),
+        asyncio.to_thread(client.servers.get_all),
+    )
+    await safe_edit(
+        query,
+        primary_ip_list_text(project, primary_ips, servers),
+        primary_ip_list_keyboard(pidx, primary_ips),
+    )
+
+
+async def show_primary_ip_detail(query, pidx: int, primary_ip_id: int) -> None:
+    project = get_project(pidx)
+    if not project:
+        await query.answer("پروژه پیدا نشد.", show_alert=True)
+        return
+    client = project["client"]
+    ip = await asyncio.to_thread(client.primary_ips.get_by_id, primary_ip_id)
+    if not ip or getattr(ip, "type", None) != "ipv4":
+        await query.answer("Primary IPv4 پیدا نشد.", show_alert=True)
+        return
+    assignee_id = getattr(ip, "assignee_id", None)
+    server_name = "آزاد / متصل نیست"
+    if assignee_id is not None:
+        server = await asyncio.to_thread(client.servers.get_by_id, assignee_id)
+        if server:
+            server_name = server.name
+    text = (
+        f"📦 <b>{escape(primary_ip_name(ip))}</b>\n"
+        f"📁 پروژه: <b>{escape(project['name'])}</b>\n\n"
+        f"IPv4: <code>{escape(str(ip.ip))}</code>\n"
+        f"Location: <code>{escape(primary_ip_location(ip))}</code>\n"
+        f"وضعیت: <b>{'آزاد' if assignee_id is None else 'متصل'}</b>\n"
+        f"سرور: <b>{escape(server_name)}</b>"
+    )
+    rows = []
+    if assignee_id is None:
+        rows.append(
+            [InlineKeyboardButton("🗑 حذف این IPv4 آزاد", callback_data=f"pip:askdel:{pidx}:{primary_ip_id}")]
+        )
+    else:
+        rows.append(
+            [InlineKeyboardButton("🖥 مدیریت سرور", callback_data=f"srv:open:{pidx}:{assignee_id}")]
+        )
+    rows.extend(
+        [
+            [InlineKeyboardButton("🔄 بروزرسانی", callback_data=f"pip:open:{pidx}:{primary_ip_id}")],
+            [InlineKeyboardButton("⬅️ Primary IPv4ها", callback_data=f"pips:{pidx}")],
+        ]
+    )
+    await safe_edit(query, text, InlineKeyboardMarkup(rows))
+
+
+async def show_primary_swap_choices(query, pidx: int, server_id: int) -> None:
+    project = get_project(pidx)
+    if not project:
+        await query.answer("پروژه پیدا نشد.", show_alert=True)
+        return
+    client = project["client"]
+    server, primary_ips = await asyncio.gather(
+        asyncio.to_thread(client.servers.get_by_id, server_id),
+        asyncio.to_thread(client.primary_ips.get_all),
+    )
+    if not server:
+        await query.answer("سرور پیدا نشد.", show_alert=True)
+        return
+    current = primary_ipv4_for_server(primary_ips, server_id)
+    location_name = server_location(server)
+    free_ips = [
+        ip
+        for ip in primary_ips
+        if getattr(ip, "type", None) == "ipv4"
+        and getattr(ip, "assignee_id", None) is None
+        and primary_ip_location(ip) == location_name
+    ]
+    current_line = (
+        f"<code>{escape(str(current.ip))}</code>"
+        if current
+        else "<b>ندارد</b>"
+    )
+    text = (
+        f"🔁 <b>{'تعویض' if current else 'افزودن'} Primary IPv4</b>\n\n"
+        f"سرور: <b>{escape(server.name)}</b>\n"
+        f"IP فعلی: {current_line}\n"
+        f"Location: <code>{escape(location_name)}</code>\n\n"
+        "روند کاملاً خودکار است:\n"
+        "1️⃣ خاموش کردن امن سرور و انتظار تا Off\n"
+        "2️⃣ جدا کردن IP فعلی (اگر وجود داشته باشد)\n"
+        "3️⃣ اتصال IPv4 جدید\n"
+        "4️⃣ روشن کردن دوباره سرور\n\n"
+        "IP قبلی حذف نمی‌شود و در بخش Primary IPv4های پروژه به‌صورت آزاد باقی می‌ماند."
+    )
+    rows = []
+    for ip in free_ips[:35]:
+        name = primary_ip_name(ip)
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    f"🔁 {ip.ip} | {name}"[:60],
+                    callback_data=f"pip:swap:{pidx}:{server_id}:{ip.id}",
+                )
+            ]
+        )
+    rows.append(
+        [
+            InlineKeyboardButton(
+                "✨ ساخت IPv4 جدید و تعویض خودکار",
+                callback_data=f"pip:newswap:{pidx}:{server_id}",
+            )
+        ]
+    )
+    rows.extend(
+        [
+            [InlineKeyboardButton("📦 مشاهده IPv4های پروژه", callback_data=f"pips:{pidx}")],
+            [InlineKeyboardButton("⬅️ برگشت به سرور", callback_data=f"srv:open:{pidx}:{server_id}")],
+        ]
+    )
+    if free_ips:
+        text += f"\n\nIPv4 آزاد سازگار: <b>{len(free_ips)}</b>"
+    else:
+        text += "\n\nIPv4 آزاد سازگار وجود ندارد؛ می‌توانید یک IPv4 جدید بسازید."
+    await safe_edit(query, text, InlineKeyboardMarkup(rows))
+
+
+async def wait_server_status(client, server_id: int, wanted: str, timeout: int = 300):
+    deadline = asyncio.get_running_loop().time() + timeout
+    last = None
+    while asyncio.get_running_loop().time() < deadline:
+        last = await asyncio.to_thread(client.servers.get_by_id, server_id)
+        if last and getattr(last, "status", None) == wanted:
+            return last
+        await asyncio.sleep(3)
+    return last
+
+
+def swap_progress_text(server_name: str, old_ip: str | None, new_ip: str | None, steps: list[str]) -> str:
+    return (
+        "🔁 <b>تعویض خودکار Primary IPv4</b>\n\n"
+        f"سرور: <b>{escape(server_name)}</b>\n"
+        f"IP قبلی: <code>{escape(old_ip or 'ندارد')}</code>\n"
+        f"IP جدید: <code>{escape(new_ip or 'در حال ساخت')}</code>\n\n"
+        + "\n".join(steps)
+        + "\n\nلطفاً تا پایان عملیات دکمه دیگری نزنید."
+    )
+
+
+async def perform_primary_ipv4_swap(query, pidx: int, server_id: int, target_ip_id: int | None) -> None:
+    project = get_project(pidx)
+    if not project:
+        await query.answer("پروژه پیدا نشد.", show_alert=True)
+        return
+    client = project["client"]
+    server, primary_ips = await asyncio.gather(
+        asyncio.to_thread(client.servers.get_by_id, server_id),
+        asyncio.to_thread(client.primary_ips.get_all),
+    )
+    if not server:
+        await query.answer("سرور پیدا نشد.", show_alert=True)
+        return
+
+    old_ip = primary_ipv4_for_server(primary_ips, server_id)
+    old_value = str(old_ip.ip) if old_ip else None
+    location_name = server_location(server)
+    new_ip = None
+    created_new = False
+
+    if target_ip_id is not None:
+        new_ip = await asyncio.to_thread(client.primary_ips.get_by_id, target_ip_id)
+        if not new_ip or getattr(new_ip, "type", None) != "ipv4":
+            await query.answer("IPv4 مقصد پیدا نشد.", show_alert=True)
+            return
+        if getattr(new_ip, "assignee_id", None) is not None:
+            await query.answer("این IPv4 دیگر آزاد نیست.", show_alert=True)
+            return
+        if primary_ip_location(new_ip) != location_name:
+            await query.answer("Location این IPv4 با سرور یکسان نیست.", show_alert=True)
+            return
+        if old_ip and new_ip.id == old_ip.id:
+            await query.answer("این همان IPv4 فعلی سرور است.", show_alert=True)
+            return
+
+    await query.answer("تعویض خودکار شروع شد.")
+    steps = [
+        "⏳ 1/4 خاموش کردن سرور...",
+        "▫️ 2/4 جدا کردن IP قبلی",
+        "▫️ 3/4 اتصال IP جدید",
+        "▫️ 4/4 روشن کردن سرور",
+    ]
+    await safe_edit(query, swap_progress_text(server.name, old_value, str(new_ip.ip) if new_ip else None, steps))
+
+    # Step 1: graceful shutdown and wait until Hetzner reports the server as off.
+    try:
+        fresh_server = await asyncio.to_thread(client.servers.get_by_id, server_id)
+        if getattr(fresh_server, "status", None) != "off":
+            if getattr(fresh_server, "status", None) != "stopping":
+                await asyncio.to_thread(fresh_server.shutdown)
+            fresh_server = await wait_server_status(client, server_id, "off", timeout=300)
+        if not fresh_server or getattr(fresh_server, "status", None) != "off":
+            steps[0] = "❌ 1/4 سرور در 5 دقیقه خاموش نشد"
+            await safe_edit(
+                query,
+                swap_progress_text(server.name, old_value, str(new_ip.ip) if new_ip else None, steps)
+                + "\n\nتعویض متوقف شد و هیچ IPای تغییر نکرد.",
+                InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ برگشت به سرور", callback_data=f"srv:open:{pidx}:{server_id}")]]),
+            )
+            return
+    except Exception as exc:
+        log.exception("Primary IPv4 swap shutdown failed")
+        steps[0] = "❌ 1/4 خطا در خاموش کردن سرور"
+        await safe_edit(
+            query,
+            swap_progress_text(server.name, old_value, str(new_ip.ip) if new_ip else None, steps)
+            + f"\n\n<code>{escape(str(exc))}</code>",
+            InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ برگشت به سرور", callback_data=f"srv:open:{pidx}:{server_id}")]]),
+        )
+        return
+
+    steps[0] = "✅ 1/4 سرور کاملاً خاموش شد"
+    await safe_edit(query, swap_progress_text(server.name, old_value, str(new_ip.ip) if new_ip else None, steps))
+
+    # If requested, create a new unassigned IPv4 in the server's Location after shutdown.
+    if new_ip is None:
+        try:
+            generated_name = f"swap-{server.id}-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+            response = await asyncio.to_thread(
+                client.primary_ips.create,
+                "ipv4",
+                generated_name,
+                location=server.location,
+                auto_delete=False,
+            )
+            new_ip = response.primary_ip
+            created_new = True
+            steps[2] = f"⏳ 3/4 IPv4 جدید ساخته شد: {new_ip.ip} — در حال اتصال..."
+            await safe_edit(query, swap_progress_text(server.name, old_value, str(new_ip.ip), steps))
+        except Exception as exc:
+            log.exception("Primary IPv4 create for swap failed")
+            # Nothing has been unassigned yet, so simply power the server back on.
+            try:
+                fresh_server = await asyncio.to_thread(client.servers.get_by_id, server_id)
+                action = await asyncio.to_thread(fresh_server.power_on)
+                await asyncio.to_thread(action.wait_until_finished)
+            except Exception:
+                log.exception("Could not power server back on after primary IP create failure")
+            await safe_edit(
+                query,
+                swap_progress_text(server.name, old_value, None, steps)
+                + f"\n\n❌ ساخت IPv4 جدید ناموفق بود. IP قبلی دست‌نخورده باقی ماند.\n<code>{escape(str(exc))}</code>",
+                InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ برگشت به سرور", callback_data=f"srv:open:{pidx}:{server_id}")]]),
+            )
+            return
+
+    old_unassigned = False
+    try:
+        # Re-fetch resources right before changing assignment.
+        if old_ip:
+            old_ip = await asyncio.to_thread(client.primary_ips.get_by_id, old_ip.id)
+            action = await asyncio.to_thread(old_ip.unassign)
+            await asyncio.to_thread(action.wait_until_finished)
+            old_unassigned = True
+            steps[1] = f"✅ 2/4 IP قبلی جدا شد: {old_value}"
+        else:
+            steps[1] = "✅ 2/4 IP قبلی وجود نداشت"
+        await safe_edit(query, swap_progress_text(server.name, old_value, str(new_ip.ip), steps))
+
+        new_ip = await asyncio.to_thread(client.primary_ips.get_by_id, new_ip.id)
+        if getattr(new_ip, "assignee_id", None) is not None:
+            raise RuntimeError("IPv4 جدید دیگر آزاد نیست")
+        action = await asyncio.to_thread(new_ip.assign, assignee_id=server_id, assignee_type="server")
+        await asyncio.to_thread(action.wait_until_finished)
+        steps[2] = f"✅ 3/4 IP جدید متصل شد: {new_ip.ip}"
+        await safe_edit(query, swap_progress_text(server.name, old_value, str(new_ip.ip), steps))
+    except Exception as exc:
+        log.exception("Primary IPv4 swap assignment failed")
+        rollback_ok = not old_unassigned
+        rollback_note = ""
+        if old_ip and old_unassigned:
+            try:
+                old_ip = await asyncio.to_thread(client.primary_ips.get_by_id, old_ip.id)
+                action = await asyncio.to_thread(old_ip.assign, assignee_id=server_id, assignee_type="server")
+                await asyncio.to_thread(action.wait_until_finished)
+                rollback_ok = True
+                rollback_note = "\n✅ IP قبلی دوباره به سرور متصل شد."
+            except Exception as rollback_exc:
+                rollback_note = f"\n🛑 بازگردانی IP قبلی هم ناموفق بود: <code>{escape(str(rollback_exc))}</code>"
+                log.exception("Primary IPv4 rollback failed")
+        if created_new and new_ip:
+            try:
+                candidate = await asyncio.to_thread(client.primary_ips.get_by_id, new_ip.id)
+                if candidate and getattr(candidate, "assignee_id", None) is None:
+                    await asyncio.to_thread(candidate.delete)
+            except Exception:
+                log.exception("Could not clean up newly created Primary IPv4")
+        try:
+            fresh_server = await asyncio.to_thread(client.servers.get_by_id, server_id)
+            action = await asyncio.to_thread(fresh_server.power_on)
+            await asyncio.to_thread(action.wait_until_finished)
+        except Exception:
+            log.exception("Could not power server on after swap rollback")
+        await safe_edit(
+            query,
+            swap_progress_text(server.name, old_value, str(new_ip.ip) if new_ip else None, steps)
+            + f"\n\n❌ تعویض IP ناموفق بود.\n<code>{escape(str(exc))}</code>"
+            + rollback_note
+            + ("" if rollback_ok else "\n🛑 وضعیت IP را فوراً در پنل Hetzner بررسی کنید."),
+            InlineKeyboardMarkup(
+                [
+                    [InlineKeyboardButton("📦 Primary IPv4ها", callback_data=f"pips:{pidx}")],
+                    [InlineKeyboardButton("⬅️ برگشت به سرور", callback_data=f"srv:open:{pidx}:{server_id}")],
+                ]
+            ),
+        )
+        return
+
+    # Step 4: power the server on. The IP replacement is already complete at this point.
+    try:
+        fresh_server = await asyncio.to_thread(client.servers.get_by_id, server_id)
+        action = await asyncio.to_thread(fresh_server.power_on)
+        await asyncio.to_thread(action.wait_until_finished)
+        running = await wait_server_status(client, server_id, "running", timeout=180)
+        if running and getattr(running, "status", None) == "running":
+            steps[3] = "✅ 4/4 سرور دوباره روشن شد"
+        else:
+            steps[3] = "⚠️ 4/4 دستور روشن شدن ارسال شد؛ وضعیت هنوز Running نشده"
+    except Exception as exc:
+        log.exception("Power on after Primary IPv4 swap failed")
+        steps[3] = "❌ 4/4 IP تعویض شد اما روشن کردن سرور خطا داد"
+        await safe_edit(
+            query,
+            swap_progress_text(server.name, old_value, str(new_ip.ip), steps)
+            + f"\n\nIP جدید متصل است؛ سرور را دستی روشن کنید.\n<code>{escape(str(exc))}</code>",
+            InlineKeyboardMarkup(
+                [
+                    [InlineKeyboardButton("🟢 روشن کردن سرور", callback_data=f"srv:on:{pidx}:{server_id}")],
+                    [InlineKeyboardButton("📦 Primary IPv4ها", callback_data=f"pips:{pidx}")],
+                    [InlineKeyboardButton("⬅️ برگشت به سرور", callback_data=f"srv:open:{pidx}:{server_id}")],
+                ]
+            ),
+        )
+        return
+
+    final_text = swap_progress_text(server.name, old_value, str(new_ip.ip), steps)
+    final_text += "\n\n✅ <b>تعویض Primary IPv4 با موفقیت انجام شد.</b>"
+    if old_value:
+        final_text += f"\n📦 IP قبلی <code>{escape(old_value)}</code> حذف نشده و اکنون در لیست Primary IPv4های پروژه آزاد است."
+    await safe_edit(
+        query,
+        final_text,
+        InlineKeyboardMarkup(
+            [
+                [InlineKeyboardButton("🖥 برگشت به سرور", callback_data=f"srv:open:{pidx}:{server_id}")],
+                [InlineKeyboardButton("📦 مدیریت IPv4های موجود", callback_data=f"pips:{pidx}")],
+            ]
+        ),
+    )
 
 
 async def show_project_traffic(query, pidx: int) -> None:
@@ -644,6 +1087,8 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 "• ابتدا پروژه را انتخاب کنید.\n"
                 "• لیست سرورها داخل همان پیام پروژه نمایش داده می‌شود.\n"
                 "• تمام منوها با ویرایش همان پیام باز می‌شوند و دکمه برگشت دارند.\n"
+                "• Primary IPv4 را می‌توانید خودکار تعویض کنید؛ ربات سرور را خاموش، IP را جابه‌جا و دوباره روشن می‌کند.\n"
+                "• IP قبلی بعد از تعویض حذف نمی‌شود و در بخش Primary IPv4های پروژه قابل مشاهده و حذف است.\n"
                 "• Floating IP را می‌توانید بسازید، متصل، منتقل، جدا و حذف کنید.\n"
                 "• بعد از اتصال، دستور Linux برای افزودن IP نمایش داده می‌شود.\n"
                 "• Rescale فقط روی سرور خاموش انجام می‌شود.\n"
@@ -658,6 +1103,10 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if data.startswith("fips:"):
             await query.answer()
             await show_floating_list(query, int(data.split(":", 1)[1]))
+            return
+        if data.startswith("pips:"):
+            await query.answer()
+            await show_primary_ip_list(query, int(data.split(":", 1)[1]))
             return
         if data.startswith("traffic:"):
             target = data.split(":", 1)[1]
@@ -705,28 +1154,9 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             elif action == "resize":
                 await query.answer()
                 await show_resize_options(query, pidx, sid)
-            elif action == "assignpip":
-                if server.status != "off":
-                    await query.answer("برای اتصال Primary IPv4 ابتدا سرور را خاموش کنید.", show_alert=True)
-                    return
-                primary_ips = await asyncio.to_thread(client.primary_ips.get_all)
-                free_ip = next(
-                    (
-                        ip
-                        for ip in primary_ips
-                        if getattr(ip, "type", None) == "ipv4"
-                        and getattr(ip, "assignee_id", None) is None
-                        and getattr(getattr(ip, "location", None), "name", None) == server_location(server)
-                    ),
-                    None,
-                )
-                if not free_ip:
-                    await query.answer("Primary IPv4 آزاد و هم‌Location پیدا نشد.", show_alert=True)
-                    return
-                await query.answer("در حال اتصال Primary IPv4...")
-                act = await asyncio.to_thread(free_ip.assign, assignee_id=server.id, assignee_type="server")
-                await asyncio.to_thread(act.wait_until_finished)
-                await show_server(query, pidx, sid, f"✅ Primary IPv4 <code>{escape(str(free_ip.ip))}</code> متصل شد.")
+            elif action == "swappip":
+                await query.answer()
+                await show_primary_swap_choices(query, pidx, sid)
             elif action == "askpip":
                 ipv4 = server_ipv4(server)
                 if not ipv4:
@@ -738,7 +1168,7 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                     f"⚠️ <b>حذف Primary IPv4</b>\n\n"
                     f"سرور: <b>{escape(server.name)}</b>\n"
                     f"IP: <code>{escape(ipv4)}</code>\n\n"
-                    "IP ابتدا Unassign و سپس از پروژه حذف می‌شود. ادامه می‌دهید؟",
+                    "برای حذف مستقیم، سرور باید خاموش باشد. IP ابتدا Unassign و سپس از پروژه حذف می‌شود. ادامه می‌دهید؟",
                     InlineKeyboardMarkup(
                         [
                             [InlineKeyboardButton("✅ بله، حذف شود", callback_data=f"srv:delpip:{pidx}:{sid}")],
@@ -751,14 +1181,7 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                     await query.answer("برای حذف Primary IPv4 ابتدا سرور را خاموش کنید.", show_alert=True)
                     return
                 primary_ips = await asyncio.to_thread(client.primary_ips.get_all)
-                target = next(
-                    (
-                        ip
-                        for ip in primary_ips
-                        if getattr(ip, "type", None) == "ipv4" and getattr(ip, "assignee_id", None) == sid
-                    ),
-                    None,
-                )
+                target = primary_ipv4_for_server(primary_ips, sid)
                 if not target:
                     await query.answer("Primary IPv4 متصل پیدا نشد.", show_alert=True)
                     return
@@ -772,6 +1195,74 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             elif action == "fips":
                 await query.answer()
                 await show_server_fips(query, pidx, sid)
+            return
+
+        if kind == "pip":
+            action = parts[1]
+            if action == "open":
+                pidx, ipid = int(parts[2]), int(parts[3])
+                await query.answer()
+                await show_primary_ip_detail(query, pidx, ipid)
+            elif action == "askdel":
+                pidx, ipid = int(parts[2]), int(parts[3])
+                project = get_project(pidx)
+                if not project:
+                    await query.answer("پروژه پیدا نشد.", show_alert=True)
+                    return
+                ip = await asyncio.to_thread(project["client"].primary_ips.get_by_id, ipid)
+                if not ip or getattr(ip, "type", None) != "ipv4":
+                    await query.answer("Primary IPv4 پیدا نشد.", show_alert=True)
+                    return
+                if getattr(ip, "assignee_id", None) is not None:
+                    await query.answer("این IPv4 هنوز به یک سرور متصل است و قابل حذف نیست.", show_alert=True)
+                    return
+                await query.answer()
+                await safe_edit(
+                    query,
+                    f"⚠️ <b>حذف Primary IPv4 آزاد</b>\n\n"
+                    f"IP: <code>{escape(str(ip.ip))}</code>\n"
+                    f"نام: <b>{escape(primary_ip_name(ip))}</b>\n\n"
+                    "این IP از پروژه Hetzner حذف می‌شود و این کار قابل بازگشت نیست. ادامه می‌دهید؟",
+                    InlineKeyboardMarkup(
+                        [
+                            [InlineKeyboardButton("🗑 بله، حذف شود", callback_data=f"pip:delete:{pidx}:{ipid}")],
+                            [InlineKeyboardButton("⬅️ انصراف", callback_data=f"pip:open:{pidx}:{ipid}")],
+                        ]
+                    ),
+                )
+            elif action == "delete":
+                pidx, ipid = int(parts[2]), int(parts[3])
+                project = get_project(pidx)
+                if not project:
+                    await query.answer("پروژه پیدا نشد.", show_alert=True)
+                    return
+                client = project["client"]
+                ip = await asyncio.to_thread(client.primary_ips.get_by_id, ipid)
+                if not ip or getattr(ip, "type", None) != "ipv4":
+                    await query.answer("Primary IPv4 پیدا نشد.", show_alert=True)
+                    return
+                if getattr(ip, "assignee_id", None) is not None:
+                    await query.answer("ابتدا باید IP از سرور جدا شود.", show_alert=True)
+                    return
+                ip_value = str(ip.ip)
+                await query.answer("در حال حذف IPv4...")
+                await asyncio.to_thread(ip.delete)
+                primary_ips, servers = await asyncio.gather(
+                    asyncio.to_thread(client.primary_ips.get_all),
+                    asyncio.to_thread(client.servers.get_all),
+                )
+                await safe_edit(
+                    query,
+                    f"✅ Primary IPv4 <code>{escape(ip_value)}</code> حذف شد.\n\n"
+                    + primary_ip_list_text(project, primary_ips, servers),
+                    primary_ip_list_keyboard(pidx, primary_ips),
+                )
+            elif action == "swap":
+                pidx, sid, ipid = int(parts[2]), int(parts[3]), int(parts[4])
+                await perform_primary_ipv4_swap(query, pidx, sid, ipid)
+            elif action == "newswap":
+                pidx, sid = int(parts[2]), int(parts[3])
+                await perform_primary_ipv4_swap(query, pidx, sid, None)
             return
 
         if kind == "rzt":
