@@ -18,7 +18,7 @@ CYAN='\033[0;36m'
 BOLD='\033[1m'
 NC='\033[0m'
 
-INSTALLER_VERSION="8.0"
+INSTALLER_VERSION="7.0"
 TTY_FD=0
 if [[ -r /dev/tty && -w /dev/tty ]]; then
   exec 3<>/dev/tty
@@ -291,12 +291,10 @@ update_flow() {
   download_file "setup.sh" "$APP_DIR/setup.sh" 0755
   download_file "README.md" "$APP_DIR/README.md" 0644 || true
   install_python_deps
-  # v8+: Cost-Optimized availability checks run hourly. Keep all other existing settings.
-  set_env_value "CHEAP_CHECK_HOURS" "1"
   write_service
   $SUDO chown -R "$BOT_USER:$BOT_USER" "$APP_DIR"
   restart_service
-  info "Update completed. Existing tokens and settings were preserved; Cost-Optimized checks are now hourly."
+  info "Update completed. Existing tokens and settings were preserved."
 }
 
 load_projects_file() {

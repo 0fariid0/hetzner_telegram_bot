@@ -151,31 +151,54 @@ def clip(text: str, limit: int = MAX_TEXT) -> str:
     return "\n".join(out) + suffix
 
 
-def cost_monitor_enabled() -> bool:
-    state = read_availability_state()
-    return bool(state.get("enabled", True))
+async def compact_overview_text() -> str:
+    async def one_project(project: dict) -> tuple[str, int, int, int]:
+        client = project["client"]
+        servers, fips, primary_ips = await asyncio.gather(
+            asyncio.to_thread(client.servers.get_all),
+            asyncio.to_thread(client.floating_ips.get_all),
+            asyncio.to_thread(client.primary_ips.get_all),
+        )
+        free_primary_ipv4 = sum(
+            1
+            for ip in primary_ips
+            if getattr(ip, "type", None) == "ipv4"
+            and getattr(ip, "assignee_id", None) is None
+        )
+        return project["name"], len(servers), len(fips), free_primary_ipv4
 
-
-def main_text() -> str:
-    enabled = cost_monitor_enabled()
-    monitor_status = "🟢 روشن" if enabled else "🔴 خاموش"
-    return (
-        "🤖 <b>پنل خصوصی Hetzner</b>\n\n"
-        f"📁 پروژه‌ها: <b>{len(PROJECTS)}</b>\n"
-        "برای مدیریت، ابتدا پروژه را انتخاب کنید.\n\n"
-        "🚨 ترافیک 18 / 19 / 20 TB هر شب بررسی می‌شود.\n"
-        f"💸 مانیتور Cost-Optimized: <b>{monitor_status}</b> — هر <b>{CHEAP_CHECK_HOURS:g} ساعت</b>"
+    results = await asyncio.gather(
+        *(one_project(project) for project in PROJECTS),
+        return_exceptions=True,
     )
+
+    lines = [f"🤖 <b>Hetzner</b>  |  📁 <b>{len(PROJECTS)} پروژه</b>"]
+    for project, result in zip(PROJECTS, results):
+        name = escape(project["name"])
+        if isinstance(result, Exception):
+            lines.append(f"• <b>{name}</b> — ⚠️ خطای آمار")
+            continue
+
+        _, server_count, fip_count, free_primary_count = result
+        stats = []
+        if server_count:
+            stats.append(f"🖥 {server_count}")
+        if fip_count:
+            stats.append(f"🌐 {fip_count} FIP")
+        if free_primary_count:
+            stats.append(f"📦 {free_primary_count} IPv4 آزاد")
+
+        suffix = f" — {' | '.join(stats)}" if stats else ""
+        lines.append(f"• <b>{name}</b>{suffix}")
+
+    return "\n".join(lines)
 
 
 def main_keyboard() -> InlineKeyboardMarkup:
-    enabled = cost_monitor_enabled()
-    toggle_label = "🟢 مانیتور Cost-Optimized: روشن" if enabled else "🔴 مانیتور Cost-Optimized: خاموش"
     return InlineKeyboardMarkup(
         [
             [InlineKeyboardButton("📁 انتخاب پروژه", callback_data="projects")],
             [InlineKeyboardButton("💸 موجودی Cost-Optimized", callback_data="cheap:show")],
-            [InlineKeyboardButton(toggle_label, callback_data="cheap:toggle")],
             [InlineKeyboardButton("📊 ترافیک همه پروژه‌ها", callback_data="traffic:all")],
             [InlineKeyboardButton("ℹ️ راهنما", callback_data="help")],
         ]
@@ -326,8 +349,7 @@ async def deny(update: Update) -> None:
 
 
 async def show_projects(query) -> None:
-    text = "📁 <b>پروژه‌های Hetzner</b>\n\nپروژه موردنظر را انتخاب کنید:"
-    await safe_edit(query, text, projects_keyboard())
+    await safe_edit(query, await compact_overview_text(), projects_keyboard())
 
 
 async def fetch_project_data(pidx: int):
@@ -402,19 +424,13 @@ def cost_optimized_matrix(server_types: list) -> dict[str, list]:
 
 
 def cost_optimized_text(matrix: dict[str, list], *, title: str = "💸 موجودی Cost-Optimized") -> str:
-    enabled = cost_monitor_enabled()
-    monitor_status = "🟢 روشن" if enabled else "🔴 خاموش"
-    lines = [f"<b>{title}</b>", f"مانیتور خودکار: <b>{monitor_status}</b>", ""]
+    lines = [f"<b>{title}</b>", ""]
     if not matrix:
         lines.extend(
             [
                 "در حال حاضر هیچ پلن Cost-Optimized قابل سفارشی از طریق API گزارش نشده است.",
                 "",
-                (
-                    f"🔄 بررسی خودکار: هر <b>{CHEAP_CHECK_HOURS:g} ساعت</b>"
-                    if enabled
-                    else "⏸ بررسی خودکار در حال حاضر <b>خاموش</b> است."
-                ),
+                f"ربات هر <b>{CHEAP_CHECK_HOURS:g} ساعت</b> دوباره بررسی می‌کند.",
             ]
         )
         return "\n".join(lines)
@@ -429,11 +445,7 @@ def cost_optimized_text(matrix: dict[str, list], *, title: str = "💸 موجو�
     lines.extend(
         [
             "⚠️ موجودی API یک شاخص لحظه‌ای است و Hetzner تضمین نمی‌کند مرحله نهایی Allocation همیشه موفق شود.",
-            (
-                f"🔄 بررسی خودکار: هر <b>{CHEAP_CHECK_HOURS:g} ساعت</b>"
-                if enabled
-                else "⏸ بررسی خودکار در حال حاضر <b>خاموش</b> است."
-            ),
+            f"🔄 بررسی خودکار: هر <b>{CHEAP_CHECK_HOURS:g} ساعت</b>",
         ]
     )
     return "\n".join(lines)
@@ -453,38 +465,17 @@ async def fetch_cost_optimized_matrix() -> tuple[dict, dict[str, list]]:
 
 async def show_cost_optimized(query) -> None:
     _, matrix = await fetch_cost_optimized_matrix()
-    enabled = cost_monitor_enabled()
-    toggle_label = "⏸ خاموش کردن مانیتور" if enabled else "▶️ روشن کردن مانیتور"
     await safe_edit(
         query,
         cost_optimized_text(matrix),
         InlineKeyboardMarkup(
             [
                 [InlineKeyboardButton("🔄 بررسی دوباره", callback_data="cheap:show")],
-                [InlineKeyboardButton(toggle_label, callback_data="cheap:toggle")],
                 [InlineKeyboardButton("📁 انتخاب پروژه برای ساخت", callback_data="projects")],
                 [InlineKeyboardButton("⬅️ منوی اصلی", callback_data="main")],
             ]
         ),
     )
-
-
-async def toggle_cost_optimized_monitor(query) -> None:
-    state = read_availability_state()
-    enabled = not bool(state.get("enabled", True))
-    state["enabled"] = enabled
-    state["updated_at"] = datetime.now(ZoneInfo(BOT_TIMEZONE)).isoformat()
-    write_availability_state(state)
-    await query.answer("مانیتور Cost-Optimized روشن شد ✅" if enabled else "مانیتور Cost-Optimized خاموش شد ⏸")
-    try:
-        await show_cost_optimized(query)
-    except Exception:
-        status = "🟢 روشن" if enabled else "🔴 خاموش"
-        await safe_edit(
-            query,
-            f"💸 <b>مانیتور Cost-Optimized</b>\n\nوضعیت: <b>{status}</b>\nبررسی خودکار: هر <b>{CHEAP_CHECK_HOURS:g} ساعت</b>",
-            InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ منوی اصلی", callback_data="main")]]),
-        )
 
 
 def valid_server_name(name: str) -> bool:
@@ -1347,7 +1338,7 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     try:
         if data == "main":
             await query.answer()
-            await safe_edit(query, main_text(), main_keyboard())
+            await safe_edit(query, await compact_overview_text(), main_keyboard())
             return
         if data == "projects":
             await query.answer()
@@ -1367,7 +1358,7 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 "• بعد از اتصال، دستور Linux برای افزودن IP نمایش داده می‌شود.\n"
                 "• Rescale فقط روی سرور خاموش انجام می‌شود.\n"
                 "• ساخت و حذف سرور از داخل هر پروژه انجام می‌شود؛ برای ساخت، نام را تایپ و بقیه گزینه‌ها را با دکمه انتخاب می‌کنید.\n"
-                f"• مانیتور Cost-Optimized هر {CHEAP_CHECK_HOURS:g} ساعت بررسی می‌کند و از داخل ربات قابل روشن/خاموش کردن است.\n"
+                f"• موجودی Cost-Optimized هر {CHEAP_CHECK_HOURS:g} ساعت بررسی و در صورت موجودشدن اطلاع داده می‌شود.\n"
                 "• هشدار 18/19/20 TB هر شب فقط یک بار در روز ارسال می‌شود.",
                 InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ منوی اصلی", callback_data="main")]]),
             )
@@ -1375,9 +1366,6 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if data == "cheap:show":
             await query.answer("در حال بررسی موجودی...")
             await show_cost_optimized(query)
-            return
-        if data == "cheap:toggle":
-            await toggle_cost_optimized_monitor(query)
             return
         if data.startswith("project:"):
             await query.answer()
@@ -2161,7 +2149,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not authorized(update):
         await deny(update)
         return
-    await render_message(update.effective_message, main_text(), main_keyboard())
+    await render_message(update.effective_message, await compact_overview_text(), main_keyboard())
 
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2351,7 +2339,7 @@ def availability_pairs(matrix: dict[str, list]) -> list[str]:
 
 
 async def cost_optimized_availability_job(context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not ALLOWED_USER_ID or not cost_monitor_enabled():
+    if not ALLOWED_USER_ID:
         return
     try:
         _, matrix = await fetch_cost_optimized_matrix()
