@@ -195,10 +195,15 @@ async def compact_overview_text() -> str:
 
 
 def main_keyboard() -> InlineKeyboardMarkup:
+    monitor_enabled = cost_monitor_enabled()
+    monitor_button = "🔕 خاموش" if monitor_enabled else "🔔 روشن"
     return InlineKeyboardMarkup(
         [
             [InlineKeyboardButton("📁 انتخاب پروژه", callback_data="projects")],
-            [InlineKeyboardButton("💸 موجودی Cost-Optimized", callback_data="cheap:show")],
+            [
+                InlineKeyboardButton("💸 Cost-Optimized", callback_data="cheap:show"),
+                InlineKeyboardButton(monitor_button, callback_data="cheap:togglemain"),
+            ],
             [InlineKeyboardButton("📊 ترافیک همه پروژه‌ها", callback_data="traffic:all")],
             [InlineKeyboardButton("ℹ️ راهنما", callback_data="help")],
         ]
@@ -463,14 +468,37 @@ async def fetch_cost_optimized_matrix() -> tuple[dict, dict[str, list]]:
     raise RuntimeError(f"هیچ توکن فعالی برای بررسی موجودی پاسخ نداد: {last_exc}")
 
 
-async def show_cost_optimized(query) -> None:
+def cost_monitor_enabled() -> bool:
+    state = read_availability_state()
+    return bool(state.get("enabled", True))
+
+
+def set_cost_monitor_enabled(enabled: bool) -> None:
+    state = read_availability_state()
+    state["enabled"] = bool(enabled)
+    state["updated_at"] = datetime.now(ZoneInfo(BOT_TIMEZONE)).isoformat()
+    write_availability_state(state)
+
+
+async def show_cost_optimized(query, notice: str | None = None) -> None:
     _, matrix = await fetch_cost_optimized_matrix()
+    enabled = cost_monitor_enabled()
+    text = cost_optimized_text(matrix)
+    status = "🟢 روشن" if enabled else "🔴 خاموش"
+    text += f"\n\n🔔 مانیتور: <b>{status}</b> — هر <b>{CHEAP_CHECK_HOURS:g} ساعت</b>"
+    if notice:
+        text = f"{escape(notice)}\n\n{text}"
+
+    toggle_text = "🔕 خاموش کردن مانیتور" if enabled else "🔔 روشن کردن مانیتور"
     await safe_edit(
         query,
-        cost_optimized_text(matrix),
+        text,
         InlineKeyboardMarkup(
             [
-                [InlineKeyboardButton("🔄 بررسی دوباره", callback_data="cheap:show")],
+                [
+                    InlineKeyboardButton("🔄 بررسی دوباره", callback_data="cheap:show"),
+                    InlineKeyboardButton(toggle_text, callback_data="cheap:toggle"),
+                ],
                 [InlineKeyboardButton("📁 انتخاب پروژه برای ساخت", callback_data="projects")],
                 [InlineKeyboardButton("⬅️ منوی اصلی", callback_data="main")],
             ]
@@ -1358,7 +1386,7 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 "• بعد از اتصال، دستور Linux برای افزودن IP نمایش داده می‌شود.\n"
                 "• Rescale فقط روی سرور خاموش انجام می‌شود.\n"
                 "• ساخت و حذف سرور از داخل هر پروژه انجام می‌شود؛ برای ساخت، نام را تایپ و بقیه گزینه‌ها را با دکمه انتخاب می‌کنید.\n"
-                f"• موجودی Cost-Optimized هر {CHEAP_CHECK_HOURS:g} ساعت بررسی و در صورت موجودشدن اطلاع داده می‌شود.\n"
+                f"• مانیتور Cost-Optimized هر {CHEAP_CHECK_HOURS:g} ساعت بررسی می‌کند و از صفحه موجودی قابل روشن/خاموش کردن است.\n"
                 "• هشدار 18/19/20 TB هر شب فقط یک بار در روز ارسال می‌شود.",
                 InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ منوی اصلی", callback_data="main")]]),
             )
@@ -1366,6 +1394,19 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if data == "cheap:show":
             await query.answer("در حال بررسی موجودی...")
             await show_cost_optimized(query)
+            return
+        if data in {"cheap:toggle", "cheap:togglemain"}:
+            current = cost_monitor_enabled()
+            new_state = not current
+            set_cost_monitor_enabled(new_state)
+            await query.answer("مانیتور روشن شد." if new_state else "مانیتور خاموش شد.")
+            if data == "cheap:togglemain":
+                await safe_edit(query, await compact_overview_text(), main_keyboard())
+            else:
+                await show_cost_optimized(
+                    query,
+                    "✅ مانیتور Cost-Optimized روشن شد." if new_state else "⏸ مانیتور Cost-Optimized خاموش شد.",
+                )
             return
         if data.startswith("project:"):
             await query.answer()
@@ -2339,7 +2380,7 @@ def availability_pairs(matrix: dict[str, list]) -> list[str]:
 
 
 async def cost_optimized_availability_job(context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not ALLOWED_USER_ID:
+    if not ALLOWED_USER_ID or not cost_monitor_enabled():
         return
     try:
         _, matrix = await fetch_cost_optimized_matrix()
