@@ -298,3 +298,5 @@ hetzner_telegram_bot/
 - ربات با Linux user جداگانه `hetznerbot` اجرا می‌شود.
 - دسترسی Telegram فقط برای User ID مشخص‌شده فعال است.
 - Tokenها در منوی List به‌صورت Mask شده نمایش داده می‌شوند.
+
+- سیستم‌عامل پیش‌فرض ساخت سرور: **Ubuntu 24.04 LTS** (`ubuntu-24.04`).

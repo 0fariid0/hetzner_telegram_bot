@@ -508,18 +508,15 @@ def valid_server_name(name: str) -> bool:
 
 
 def latest_ubuntu_image(images: list):
-    candidates = []
+    """Return Ubuntu 24.04 LTS as the default image for new servers."""
     for image in images:
         name = str(getattr(image, "name", "") or "")
-        if not name.startswith("ubuntu-"):
+        if name != "ubuntu-24.04":
             continue
         if getattr(image, "status", "available") not in (None, "available"):
             continue
-        m = re.fullmatch(r"ubuntu-(\d+)\.(\d+)", name)
-        if not m:
-            continue
-        candidates.append(((int(m.group(1)), int(m.group(2))), image))
-    return max(candidates, key=lambda x: x[0])[1] if candidates else None
+        return image
+    return None
 
 
 def server_create_summary(project: dict, pending: dict, location, server_type, image, ipv6: bool) -> str:
@@ -626,7 +623,7 @@ async def show_create_confirmation(query, context: ContextTypes.DEFAULT_TYPE, pi
     )
     image = latest_ubuntu_image(images)
     if not image:
-        await query.answer("Ubuntu سازگار با این معماری پیدا نشد.", show_alert=True)
+        await query.answer("Ubuntu 24.04 LTS سازگار با این معماری پیدا نشد.", show_alert=True)
         return
     pending["image_id"] = image.id
     context.user_data["server_create"] = pending
