@@ -524,6 +524,10 @@ def latest_ubuntu_image(images: list):
 
 def server_create_summary(project: dict, pending: dict, location, server_type, image, ipv6: bool) -> str:
     cost_tag = "💸 Cost-Optimized" if is_cost_optimized_server_type(server_type) else "☁️ Cloud"
+    if pending.get("auth_mode") == "ssh":
+        auth_text = f"🔑 SSH Key — <code>{escape(str(pending.get('ssh_key_name') or 'Selected key'))}</code>"
+    else:
+        auth_text = "🔐 رمز root خودکار Hetzner"
     return (
         f"➕ <b>تأیید ساخت سرور — {escape(project['name'])}</b>\n\n"
         f"نام: <code>{escape(pending['name'])}</code>\n"
@@ -533,8 +537,109 @@ def server_create_summary(project: dict, pending: dict, location, server_type, i
         f"معماری: <code>{escape(str(server_type.architecture))}</code>\n"
         f"سیستم‌عامل: <code>{escape(image.name)}</code>\n"
         f"IPv4: ✅ فعال\n"
-        f"IPv6: {'✅ فعال' if ipv6 else '❌ غیرفعال'}\n\n"
+        f"IPv6: {'✅ فعال' if ipv6 else '❌ غیرفعال'}\n"
+        f"ورود: {auth_text}\n\n"
         "با تأیید، سرور ساخته و روشن می‌شود."
+    )
+
+
+async def show_create_auth_method(query, context: ContextTypes.DEFAULT_TYPE, pidx: int) -> None:
+    pending = context.user_data.get("server_create", {})
+    if int(pending.get("project", -1)) != pidx or not pending.get("server_type_id"):
+        await query.answer("فرآیند ساخت منقضی شده؛ دوباره شروع کنید.", show_alert=True)
+        return
+    await safe_edit(
+        query,
+        "➕ <b>ساخت سرور</b>\n\n"
+        f"نام: <code>{escape(pending['name'])}</code>\n"
+        f"IPv6: {'✅ فعال' if pending.get('ipv6') else '❌ غیرفعال'}\n\n"
+        "روش ورود اولیه به سرور را انتخاب کنید:",
+        InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton("🔑 SSH Key", callback_data=f"newsv:authkey:{pidx}"),
+                    InlineKeyboardButton("🔐 رمز root", callback_data=f"newsv:authpass:{pidx}"),
+                ],
+                [InlineKeyboardButton("⬅️ تغییر IPv6", callback_data=f"newsv:plan:{pidx}:{pending['server_type_id']}")],
+                [InlineKeyboardButton("❌ انصراف", callback_data=f"project:{pidx}")],
+            ]
+        ),
+    )
+
+
+async def show_create_ssh_keys(query, context: ContextTypes.DEFAULT_TYPE, pidx: int) -> None:
+    project = get_project(pidx)
+    pending = context.user_data.get("server_create", {})
+    if not project or int(pending.get("project", -1)) != pidx:
+        await query.answer("فرآیند ساخت منقضی شده؛ دوباره شروع کنید.", show_alert=True)
+        return
+    keys = await asyncio.to_thread(project["client"].ssh_keys.get_all)
+    if not keys:
+        await safe_edit(
+            query,
+            "🔑 <b>SSH Key</b>\n\n"
+            "در این پروژه هیچ SSH Key ثبت نشده است.\n"
+            "می‌توانید سرور را با رمز root بسازید.",
+            InlineKeyboardMarkup(
+                [
+                    [InlineKeyboardButton("🔐 ساخت با رمز root", callback_data=f"newsv:authpass:{pidx}")],
+                    [InlineKeyboardButton("⬅️ برگشت", callback_data=f"newsv:auth:{pidx}")],
+                ]
+            ),
+        )
+        return
+    rows = []
+    pair = []
+    for key in keys:
+        name = str(getattr(key, "name", "") or f"Key {key.id}")
+        pair.append(InlineKeyboardButton(f"🔑 {name[:28]}", callback_data=f"newsv:key:{pidx}:{key.id}"))
+        if len(pair) == 2:
+            rows.append(pair)
+            pair = []
+    if pair:
+        rows.append(pair)
+    rows.append([InlineKeyboardButton("⬅️ روش ورود", callback_data=f"newsv:auth:{pidx}")])
+    await safe_edit(
+        query,
+        f"🔑 <b>SSH Key — {escape(project['name'])}</b>\n\nکلید موردنظر را انتخاب کنید:",
+        InlineKeyboardMarkup(rows),
+    )
+
+
+async def show_create_confirmation(query, context: ContextTypes.DEFAULT_TYPE, pidx: int) -> None:
+    project = get_project(pidx)
+    pending = context.user_data.get("server_create", {})
+    if not project or int(pending.get("project", -1)) != pidx:
+        await query.answer("فرآیند ساخت منقضی شده؛ دوباره شروع کنید.", show_alert=True)
+        return
+    client = project["client"]
+    st = await asyncio.to_thread(client.server_types.get_by_id, int(pending["server_type_id"]))
+    location = await asyncio.to_thread(client.locations.get_by_id, int(pending["location_id"]))
+    if not st or not location:
+        await query.answer("پلن یا Location پیدا نشد.", show_alert=True)
+        return
+    images = await asyncio.to_thread(
+        client.images.get_all,
+        type=["system"],
+        architecture=[st.architecture],
+        include_deprecated=False,
+    )
+    image = latest_ubuntu_image(images)
+    if not image:
+        await query.answer("Ubuntu سازگار با این معماری پیدا نشد.", show_alert=True)
+        return
+    pending["image_id"] = image.id
+    context.user_data["server_create"] = pending
+    await safe_edit(
+        query,
+        server_create_summary(project, pending, location, st, image, bool(pending.get("ipv6", True))),
+        InlineKeyboardMarkup(
+            [
+                [InlineKeyboardButton("✅ ساخت سرور", callback_data=f"newsv:create:{pidx}")],
+                [InlineKeyboardButton("⬅️ تغییر روش ورود", callback_data=f"newsv:auth:{pidx}")],
+                [InlineKeyboardButton("❌ انصراف", callback_data=f"project:{pidx}")],
+            ]
+        ),
     )
 
 
@@ -1721,37 +1826,54 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 return
 
             if action in {"ip6on", "ip6off"}:
-                ipv6 = action == "ip6on"
-                pending["ipv6"] = ipv6
-                st = await asyncio.to_thread(client.server_types.get_by_id, int(pending["server_type_id"]))
-                location = await asyncio.to_thread(client.locations.get_by_id, int(pending["location_id"]))
-                images = await asyncio.to_thread(
-                    client.images.get_all,
-                    type=["system"],
-                    architecture=[st.architecture],
-                    include_deprecated=False,
-                )
-                image = latest_ubuntu_image(images)
-                if not image:
-                    await query.answer("Ubuntu سازگار با این معماری پیدا نشد.", show_alert=True)
-                    return
-                pending["image_id"] = image.id
+                pending["ipv6"] = action == "ip6on"
+                pending.pop("auth_mode", None)
+                pending.pop("ssh_key_id", None)
+                pending.pop("ssh_key_name", None)
                 context.user_data["server_create"] = pending
                 await query.answer()
-                await safe_edit(
-                    query,
-                    server_create_summary(project, pending, location, st, image, ipv6),
-                    InlineKeyboardMarkup(
-                        [
-                            [InlineKeyboardButton("✅ ساخت سرور", callback_data=f"newsv:create:{pidx}")],
-                            [InlineKeyboardButton("⬅️ تغییر IPv6", callback_data=f"newsv:plan:{pidx}:{st.id}")],
-                            [InlineKeyboardButton("❌ انصراف", callback_data=f"project:{pidx}")],
-                        ]
-                    ),
-                )
+                await show_create_auth_method(query, context, pidx)
+                return
+
+            if action == "auth":
+                await query.answer()
+                await show_create_auth_method(query, context, pidx)
+                return
+
+            if action == "authkey":
+                await query.answer("در حال دریافت SSH Keyهای پروژه...")
+                await show_create_ssh_keys(query, context, pidx)
+                return
+
+            if action == "authpass":
+                pending["auth_mode"] = "password"
+                pending.pop("ssh_key_id", None)
+                pending.pop("ssh_key_name", None)
+                context.user_data["server_create"] = pending
+                await query.answer()
+                await show_create_confirmation(query, context, pidx)
+                return
+
+            if action == "key":
+                key_id = int(parts[3])
+                key = await asyncio.to_thread(client.ssh_keys.get_by_id, key_id)
+                if not key:
+                    await query.answer("SSH Key پیدا نشد یا حذف شده است.", show_alert=True)
+                    await show_create_ssh_keys(query, context, pidx)
+                    return
+                pending["auth_mode"] = "ssh"
+                pending["ssh_key_id"] = key.id
+                pending["ssh_key_name"] = str(getattr(key, "name", "") or f"Key {key.id}")
+                context.user_data["server_create"] = pending
+                await query.answer()
+                await show_create_confirmation(query, context, pidx)
                 return
 
             if action == "create":
+                if pending.get("auth_mode") not in {"password", "ssh"}:
+                    await query.answer("ابتدا روش ورود (رمز یا SSH Key) را انتخاب کنید.", show_alert=True)
+                    await show_create_auth_method(query, context, pidx)
+                    return
                 st = await asyncio.to_thread(client.server_types.get_by_id, int(pending["server_type_id"]))
                 location = await asyncio.to_thread(client.locations.get_by_id, int(pending["location_id"]))
                 image = await asyncio.to_thread(client.images.get_by_id, int(pending["image_id"]))
@@ -1773,18 +1895,26 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                     "لطفاً صبر کنید؛ Allocation نهایی ممکن است کمی زمان ببرد.",
                 )
                 try:
-                    response = await asyncio.to_thread(
-                        client.servers.create,
-                        name=pending["name"],
-                        server_type=st,
-                        image=image,
-                        location=location,
-                        start_after_create=True,
-                        public_net=ServerCreatePublicNetwork(
+                    create_kwargs = {
+                        "name": pending["name"],
+                        "server_type": st,
+                        "image": image,
+                        "location": location,
+                        "start_after_create": True,
+                        "public_net": ServerCreatePublicNetwork(
                             enable_ipv4=True,
                             enable_ipv6=bool(pending.get("ipv6", True)),
                         ),
-                    )
+                    }
+                    if pending.get("auth_mode") == "ssh":
+                        key_id = pending.get("ssh_key_id")
+                        ssh_key = await asyncio.to_thread(client.ssh_keys.get_by_id, int(key_id)) if key_id else None
+                        if not ssh_key:
+                            await query.answer("SSH Key انتخاب‌شده دیگر موجود نیست.", show_alert=True)
+                            await show_create_ssh_keys(query, context, pidx)
+                            return
+                        create_kwargs["ssh_keys"] = [ssh_key]
+                    response = await asyncio.to_thread(client.servers.create, **create_kwargs)
                     await asyncio.to_thread(response.action.wait_until_finished)
                     for next_action in getattr(response, "next_actions", []) or []:
                         await asyncio.to_thread(next_action.wait_until_finished)
@@ -1811,7 +1941,9 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 context.user_data.pop("panel_chat_id", None)
                 context.user_data.pop("panel_message_id", None)
                 text = "✅ <b>سرور با موفقیت ساخته شد.</b>\n\n" + server_text(server, project["name"])
-                if root_password:
+                if pending.get("auth_mode") == "ssh":
+                    text += f"\n\n🔑 ورود با SSH Key: <code>{escape(str(pending.get('ssh_key_name') or 'Selected key'))}</code>"
+                elif root_password:
                     text += (
                         "\n\n🔐 <b>رمز root — فقط همین بار نمایش داده می‌شود:</b>\n"
                         f"<code>{escape(root_password)}</code>"
