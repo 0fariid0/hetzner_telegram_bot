@@ -195,15 +195,10 @@ async def compact_overview_text() -> str:
 
 
 def main_keyboard() -> InlineKeyboardMarkup:
-    monitor_enabled = cost_monitor_enabled()
-    monitor_button = "🔕 خاموش" if monitor_enabled else "🔔 روشن"
     return InlineKeyboardMarkup(
         [
             [InlineKeyboardButton("📁 انتخاب پروژه", callback_data="projects")],
-            [
-                InlineKeyboardButton("💸 Cost-Optimized", callback_data="cheap:show"),
-                InlineKeyboardButton(monitor_button, callback_data="cheap:togglemain"),
-            ],
+            [InlineKeyboardButton("💸 Cost-Optimized", callback_data="cheap:show")],
             [InlineKeyboardButton("📊 ترافیک همه پروژه‌ها", callback_data="traffic:all")],
             [InlineKeyboardButton("ℹ️ راهنما", callback_data="help")],
         ]
@@ -1208,34 +1203,55 @@ async def show_all_traffic(query) -> None:
     )
 
 
+def server_type_availability(server_type, location_name: str) -> bool | None:
+    """True/False when Hetzner reports availability, otherwise None."""
+    info = server_type_location_entry(server_type, location_name)
+    if info is None:
+        return None
+    value = getattr(info, "available", None)
+    return value if isinstance(value, bool) else None
+
+
 def available_server_types(client, server) -> list:
+    """Only server types currently available for migration in the server Location."""
     current = getattr(server, "server_type", None)
     current_arch = getattr(current, "architecture", None)
     current_disk = int(getattr(server, "primary_disk_size", 0) or getattr(current, "disk", 0) or 0)
     location_name = server_location(server)
     result = []
+
     for st in client.server_types.get_all():
         if st.name == getattr(current, "name", None):
             continue
         if current_arch and getattr(st, "architecture", None) != current_arch:
             continue
+
+        # Once a disk has been enlarged, Hetzner does not allow shrinking it again.
         if int(getattr(st, "disk", 0) or 0) < current_disk:
             continue
-        if getattr(st, "deprecated", False):
+
+        loc_info = server_type_location_entry(st, location_name)
+        if loc_info is None:
             continue
-        locations = getattr(st, "locations", None) or []
-        if locations:
-            matching = []
-            for loc_info in locations:
-                loc = getattr(loc_info, "location", None)
-                if getattr(loc, "name", None) == location_name:
-                    matching.append(loc_info)
-            if not matching:
-                continue
-            if any(getattr(x, "deprecation", None) for x in matching):
-                continue
+        if getattr(loc_info, "deprecation", None) is not None:
+            continue
+
+        # Important: only show types Hetzner currently reports as available
+        # for this exact Location. None/unknown is intentionally hidden.
+        if getattr(loc_info, "available", None) is not True:
+            continue
+
         result.append(st)
-    return sorted(result, key=lambda x: (getattr(x, "memory", 0), getattr(x, "cores", 0), getattr(x, "name", "")))
+
+    return sorted(
+        result,
+        key=lambda x: (
+            getattr(x, "memory", 0),
+            getattr(x, "cores", 0),
+            getattr(x, "disk", 0),
+            getattr(x, "name", ""),
+        ),
+    )
 
 
 async def show_resize_options(query, pidx: int, server_id: int) -> None:
@@ -1243,30 +1259,51 @@ async def show_resize_options(query, pidx: int, server_id: int) -> None:
     if not project:
         await query.answer("پروژه پیدا نشد.", show_alert=True)
         return
+
     client = project["client"]
     server = await asyncio.to_thread(client.servers.get_by_id, server_id)
     if not server:
         await query.answer("سرور پیدا نشد.", show_alert=True)
         return
-    if server.status != "off":
-        await query.answer("برای تغییر سایز، ابتدا سرور را خاموش کنید.", show_alert=True)
-        return
+
+    current = getattr(server, "server_type", None)
+    location_name = server_location(server)
+    fresh_current = None
+    if current and getattr(current, "id", None):
+        fresh_current = await asyncio.to_thread(client.server_types.get_by_id, current.id)
+    current_for_status = fresh_current or current
+    current_available = server_type_availability(current_for_status, location_name)
+    if current_available is True:
+        current_status = "🟢 موجود"
+    elif current_available is False:
+        current_status = "🔴 فعلاً ناموجود"
+    else:
+        current_status = "⚪ وضعیت نامشخص"
 
     types = await asyncio.to_thread(available_server_types, client, server)
-    if not types:
-        await query.answer("پلن سازگار دیگری برای این سرور پیدا نشد.", show_alert=True)
-        return
-
     rows = []
     for st in types[:35]:
-        label = f"{st.name} | {st.cores}C / {st.memory}GB / {st.disk}GB"
+        label = f"{st.name} | {st.cores}C / {st.memory:g}GB / {st.disk}GB"
         rows.append([InlineKeyboardButton(label, callback_data=f"rzt:pick:{pidx}:{server_id}:{st.id}")])
+
+    rows.append([InlineKeyboardButton("🔄 بروزرسانی موجودی", callback_data=f"srv:resize:{pidx}:{server_id}")])
     rows.append([InlineKeyboardButton("⬅️ برگشت به سرور", callback_data=f"srv:open:{pidx}:{server_id}")])
+
+    status_note = ""
+    if server.status != "off":
+        status_note = "\n\n⚠️ برای <b>اعمال</b> تغییر سایز، سرور باید خاموش باشد."
+
+    if types:
+        list_note = "فقط پلن‌هایی نمایش داده شده‌اند که همین الان در Location این سرور موجود هستند."
+    else:
+        list_note = "در حال حاضر هیچ پلن سازگار و موجود دیگری برای این سرور گزارش نشده است."
+
     await safe_edit(
         query,
         f"⚙️ <b>تغییر سایز {escape(server.name)}</b>\n\n"
-        f"پلن فعلی: <code>{escape(server.server_type.name)}</code>\n"
-        "پلن جدید را انتخاب کنید. فقط گزینه‌های هم‌معماری و سازگار نمایش داده شده‌اند.",
+        f"📍 Location: <code>{escape(location_name)}</code>\n"
+        f"پلن فعلی: <code>{escape(getattr(current, 'name', 'نامشخص'))}</code> — {current_status}\n\n"
+        f"{list_note}{status_note}",
         InlineKeyboardMarkup(rows),
     )
 
@@ -1395,18 +1432,15 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             await query.answer("در حال بررسی موجودی...")
             await show_cost_optimized(query)
             return
-        if data in {"cheap:toggle", "cheap:togglemain"}:
+        if data == "cheap:toggle":
             current = cost_monitor_enabled()
             new_state = not current
             set_cost_monitor_enabled(new_state)
             await query.answer("مانیتور روشن شد." if new_state else "مانیتور خاموش شد.")
-            if data == "cheap:togglemain":
-                await safe_edit(query, await compact_overview_text(), main_keyboard())
-            else:
-                await show_cost_optimized(
-                    query,
-                    "✅ مانیتور Cost-Optimized روشن شد." if new_state else "⏸ مانیتور Cost-Optimized خاموش شد.",
-                )
+            await show_cost_optimized(
+                query,
+                "✅ مانیتور Cost-Optimized روشن شد." if new_state else "⏸ مانیتور Cost-Optimized خاموش شد.",
+            )
             return
         if data.startswith("project:"):
             await query.answer()
@@ -1800,20 +1834,33 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                     await query.answer("سرور یا پلن پیدا نشد.", show_alert=True)
                     return
                 await query.answer()
+                current_disk = int(getattr(server, "primary_disk_size", 0) or getattr(server.server_type, "disk", 0) or 0)
+                target_disk = int(getattr(st, "disk", 0) or 0)
+                rows = [
+                    [InlineKeyboardButton("✅ تغییر CPU/RAM — دیسک دست‌نخورده", callback_data=f"rzt:go0:{pidx}:{sid}:{stid}")],
+                ]
+                if target_disk > current_disk:
+                    rows.append(
+                        [InlineKeyboardButton(f"💽 ارتقای دیسک به {target_disk} GB", callback_data=f"rzt:go1:{pidx}:{sid}:{stid}")]
+                    )
+                rows.append([InlineKeyboardButton("⬅️ برگشت", callback_data=f"srv:resize:{pidx}:{sid}")])
+
+                disk_text = (
+                    f"دیسک فعلی: <b>{current_disk} GB</b> → دیسک پلن جدید: <b>{target_disk} GB</b>\n\n"
+                    "⚠️ <b>هشدار دیسک:</b> اگر ارتقای دیسک را انتخاب کنید، افزایش فضای دیسک دائمی است؛ "
+                    "بعداً نمی‌توان Disk را کوچک کرد و ممکن است امکان برگشت به بعضی پلن‌های کوچک‌تر را از دست بدهید."
+                    if target_disk > current_disk
+                    else f"دیسک فعلی: <b>{current_disk} GB</b> — برای این تغییر نیازی به ارتقای دیسک نیست."
+                )
+
                 await safe_edit(
                     query,
-                    f"⚠️ <b>تأیید تغییر سایز</b>\n\n"
+                    f"⚙️ <b>تأیید تغییر سایز</b>\n\n"
                     f"سرور: <b>{escape(server.name)}</b>\n"
                     f"از <code>{escape(server.server_type.name)}</code> به <code>{escape(st.name)}</code>\n"
-                    f"منابع جدید: {st.cores} vCPU / {st.memory} GB RAM / {st.disk} GB\n\n"
-                    "گزینه افزایش دیسک برگشت‌پذیر نیست و بعداً امکان کوچک‌کردن Disk وجود ندارد.",
-                    InlineKeyboardMarkup(
-                        [
-                            [InlineKeyboardButton("✅ بدون افزایش دیسک", callback_data=f"rzt:go0:{pidx}:{sid}:{stid}")],
-                            [InlineKeyboardButton("💽 با افزایش دیسک", callback_data=f"rzt:go1:{pidx}:{sid}:{stid}")],
-                            [InlineKeyboardButton("⬅️ برگشت", callback_data=f"srv:resize:{pidx}:{sid}")],
-                        ]
-                    ),
+                    f"منابع جدید: {st.cores} vCPU / {st.memory:g} GB RAM / {target_disk} GB\n\n"
+                    f"{disk_text}",
+                    InlineKeyboardMarkup(rows),
                 )
             elif action in {"go0", "go1"}:
                 pidx, sid, stid = map(int, parts[2:5])
@@ -1821,8 +1868,14 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 client = project["client"]
                 server = await asyncio.to_thread(client.servers.get_by_id, sid)
                 st = await asyncio.to_thread(client.server_types.get_by_id, stid)
+                if not server or not st:
+                    await query.answer("سرور یا پلن پیدا نشد.", show_alert=True)
+                    return
+                if server_type_availability(st, server_location(server)) is not True:
+                    await query.answer("این پلن دیگر در Location سرور موجود نیست. لیست را بروزرسانی کنید.", show_alert=True)
+                    return
                 if server.status != "off":
-                    await query.answer("سرور باید خاموش باشد.", show_alert=True)
+                    await query.answer("برای اعمال تغییر سایز، ابتدا سرور را خاموش کنید.", show_alert=True)
                     return
                 upgrade_disk = action == "go1"
                 await query.answer("در حال تغییر سایز...")
