@@ -38,7 +38,7 @@ TRAFFIC_ALERT_TB = (18.0, 19.0, 20.0)
 CHEAP_CHECK_HOURS = float(os.getenv("CHEAP_CHECK_HOURS", "1") or 1)
 STATE_FILE = Path(os.getenv("STATE_FILE", "/opt/hetzner-telegram-bot/.traffic_alert_state.json"))
 AVAILABILITY_STATE_FILE = Path(os.getenv("AVAILABILITY_STATE_FILE", "/opt/hetzner-telegram-bot/.cost_optimized_state.json"))
-BOT_VERSION = "14.3"
+BOT_VERSION = "14.4"
 COST_TRACK_STATE_FILE = Path(os.getenv("COST_TRACK_STATE_FILE", "/opt/hetzner-telegram-bot/.cost_tracking.json"))
 AUTO_CREATE_STATE_FILE = Path(os.getenv("AUTO_CREATE_STATE_FILE", "/opt/hetzner-telegram-bot/.cost_auto_create.json"))
 AUTO_CREATE_CHECK_MINUTES = int(os.getenv("AUTO_CREATE_CHECK_MINUTES", "60") or 60)
@@ -156,21 +156,39 @@ def _money_to_float(value) -> float:
         return 0.0
 
 
-def server_monthly_price_eur(server) -> float:
-    """Return Hetzner monthly price from server type pricing."""
+def _money_to_float(value) -> float:
     try:
-        server_type = getattr(server, "server_type", None)
-        prices = getattr(server_type, "prices", None) or []
-        if prices:
-            loc = server_location(server)
-            for price in prices:
-                if getattr(getattr(price, "location", None), "name", "") == loc:
-                    return _money_to_float(getattr(price, "price_monthly", None))
-            return _money_to_float(getattr(prices[0], "price_monthly", None))
-        # fallback for cached server type objects
-        return _money_to_float(getattr(server_type, "price_monthly", None))
+        if value is None:
+            return 0.0
+        amount = getattr(value, "amount", None)
+        if amount is not None:
+            return float(amount)
+        if isinstance(value, dict):
+            return float(value.get("amount", 0) or 0)
+        return float(value)
     except Exception:
         return 0.0
+
+
+def server_monthly_price_eur(server, server_types=None) -> float:
+    """Get monthly price. hcloud server objects do not always contain prices."""
+    try:
+        st = getattr(server, "server_type", None)
+        prices = getattr(st, "prices", None) or []
+        if not prices and server_types:
+            sid = getattr(st, "id", None)
+            name = getattr(st, "name", None)
+            st = next((x for x in server_types if getattr(x, "id", None) == sid or getattr(x, "name", None) == name), None)
+            prices = getattr(st, "prices", None) or []
+        loc = server_location(server)
+        for price in prices:
+            if getattr(getattr(price, "location", None), "name", "") == loc:
+                return _money_to_float(getattr(price, "price_monthly", None))
+        if prices:
+            return _money_to_float(getattr(prices[0], "price_monthly", None))
+    except Exception:
+        pass
+    return 0.0
 
 
 def cost_tracking_load() -> dict:
@@ -221,8 +239,12 @@ async def cost_report_text() -> str:
             continue
         project_total = 0.0
         project_lines = []
+        try:
+            server_types = await asyncio.to_thread(project["client"].server_types.get_all)
+        except Exception:
+            server_types = []
         for server in servers:
-            price = server_monthly_price_eur(server)
+            price = server_monthly_price_eur(server, server_types)
             if price:
                 project_total += price
                 total += price
