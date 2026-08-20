@@ -5,7 +5,7 @@ import json
 import logging
 import os
 import re
-from datetime import datetime, time
+from datetime import datetime, time, timezone
 from html import escape
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -128,6 +128,48 @@ def included_tb(server) -> float | None:
     return float(raw) / HETZNER_TB_BYTES if raw else None
 
 
+def server_hourly_price(server) -> float:
+    """Return hourly price if Hetzner price data is available."""
+    st = getattr(server, "server_type", None)
+    prices = getattr(st, "prices", None) or []
+    for price in prices:
+        hourly = getattr(price, "hourly", None)
+        if isinstance(hourly, dict):
+            amount = hourly.get("gross") or hourly.get("net")
+        else:
+            amount = hourly
+        try:
+            if amount is not None:
+                return float(amount)
+        except Exception:
+            pass
+    return 0.0
+
+
+def server_monthly_cost(server) -> float:
+    return server_hourly_price(server) * 24 * 30
+
+
+def server_consumed_cost(server) -> float:
+    """Estimated current month cost from creation time."""
+    hourly = server_hourly_price(server)
+    created = getattr(server, "created", None)
+    if not hourly or not created:
+        return 0.0
+    if created.tzinfo is None:
+        created = created.replace(tzinfo=timezone.utc)
+    hours = max(0, (datetime.now(timezone.utc) - created).total_seconds() / 3600)
+    return hourly * hours
+
+
+def cost_line(server) -> str:
+    monthly = server_monthly_cost(server)
+    consumed = server_consumed_cost(server)
+    if monthly:
+        return f"💰 ماهانه: <b>€{monthly:.2f}</b> | 💳 مصرف: <b>€{consumed:.2f}</b>"
+    return ""
+
+
 def traffic_line(server) -> str:
     used = traffic_tb(server)
     included = included_tb(server)
@@ -232,6 +274,7 @@ def server_text(server, project_name: str) -> str:
         f"IPv6: <code>{escape(str(ipv6))}</code>\n"
         f"پلن: <code>{escape(str(server_type))}</code> — {cores} vCPU / {memory} GB RAM / {disk} GB\n"
         f"موقعیت: <code>{escape(server_location(server))}</code>\n"
+        f"{cost_line(server)}\n"
         f"{traffic_line(server)}"
     )
 
@@ -711,9 +754,12 @@ async def show_create_plans(query, context: ContextTypes.DEFAULT_TYPE, pidx: int
     )
 
 def project_dashboard_text(project: dict, servers: list, fips: list) -> str:
+    monthly_total = sum(server_monthly_cost(s) for s in servers)
+    consumed_total = sum(server_consumed_cost(s) for s in servers)
+    cost_summary = f"   |   💰 €{consumed_total:.2f}/€{monthly_total:.2f}" if monthly_total else ""
     lines = [
         f"📁 <b>{escape(project['name'])}</b>",
-        f"🖥 سرورها: <b>{len(servers)}</b>   |   🌐 Floating IP: <b>{len(fips)}</b>",
+        f"🖥 سرورها: <b>{len(servers)}</b>   |   🌐 Floating IP: <b>{len(fips)}</b>{cost_summary}",
         "",
         "<b>سرورها:</b>",
     ]
@@ -725,9 +771,12 @@ def project_dashboard_text(project: dict, servers: list, fips: list) -> str:
             st = getattr(getattr(server, "server_type", None), "name", "?")
             ip = server_ipv4(server) or "بدون IPv4"
             used = traffic_tb(server)
+            monthly = server_monthly_cost(server)
+            consumed = server_consumed_cost(server)
+            cost = f" — €{consumed:.2f}/€{monthly:.2f}" if monthly else ""
             lines.append(
                 f"{idx}. {status_icon(status)} <b>{escape(server.name)}</b> — "
-                f"<code>{escape(str(st))}</code> — <code>{escape(str(ip))}</code> — {used:.2f} TB"
+                f"<code>{escape(str(st))}</code> — <code>{escape(str(ip))}</code> — {used:.2f} TB{cost}"
             )
     lines.extend(["", "از دکمه‌های زیر سرور یا بخش موردنظر را انتخاب کنید."])
     return "\n".join(lines)
