@@ -5,7 +5,7 @@ import json
 import logging
 import os
 import re
-from datetime import datetime, time, timezone
+from datetime import datetime, time
 from html import escape
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -38,6 +38,10 @@ TRAFFIC_ALERT_TB = (18.0, 19.0, 20.0)
 CHEAP_CHECK_HOURS = float(os.getenv("CHEAP_CHECK_HOURS", "1") or 1)
 STATE_FILE = Path(os.getenv("STATE_FILE", "/opt/hetzner-telegram-bot/.traffic_alert_state.json"))
 AVAILABILITY_STATE_FILE = Path(os.getenv("AVAILABILITY_STATE_FILE", "/opt/hetzner-telegram-bot/.cost_optimized_state.json"))
+BOT_VERSION = "14.1"
+COST_TRACK_STATE_FILE = Path(os.getenv("COST_TRACK_STATE_FILE", "/opt/hetzner-telegram-bot/.cost_tracking.json"))
+AUTO_CREATE_STATE_FILE = Path(os.getenv("AUTO_CREATE_STATE_FILE", "/opt/hetzner-telegram-bot/.cost_auto_create.json"))
+AUTO_CREATE_CHECK_MINUTES = int(os.getenv("AUTO_CREATE_CHECK_MINUTES", "60") or 60)
 # Hetzner reports traffic as raw bytes, while the Cloud Console
 # presents its traffic quota in 1024-based "TB" units (20 TB = 20 * 1024^4 bytes).
 # Using 10^12 here makes a 20 TB quota appear as ~21.99 TB.
@@ -128,48 +132,6 @@ def included_tb(server) -> float | None:
     return float(raw) / HETZNER_TB_BYTES if raw else None
 
 
-def server_hourly_price(server) -> float:
-    """Return hourly price if Hetzner price data is available."""
-    st = getattr(server, "server_type", None)
-    prices = getattr(st, "prices", None) or []
-    for price in prices:
-        hourly = getattr(price, "hourly", None)
-        if isinstance(hourly, dict):
-            amount = hourly.get("gross") or hourly.get("net")
-        else:
-            amount = hourly
-        try:
-            if amount is not None:
-                return float(amount)
-        except Exception:
-            pass
-    return 0.0
-
-
-def server_monthly_cost(server) -> float:
-    return server_hourly_price(server) * 24 * 30
-
-
-def server_consumed_cost(server) -> float:
-    """Estimated current month cost from creation time."""
-    hourly = server_hourly_price(server)
-    created = getattr(server, "created", None)
-    if not hourly or not created:
-        return 0.0
-    if created.tzinfo is None:
-        created = created.replace(tzinfo=timezone.utc)
-    hours = max(0, (datetime.now(timezone.utc) - created).total_seconds() / 3600)
-    return hourly * hours
-
-
-def cost_line(server) -> str:
-    monthly = server_monthly_cost(server)
-    consumed = server_consumed_cost(server)
-    if monthly:
-        return f"💰 ماهانه: <b>€{monthly:.2f}</b> | 💳 مصرف: <b>€{consumed:.2f}</b>"
-    return ""
-
-
 def traffic_line(server) -> str:
     used = traffic_tb(server)
     included = included_tb(server)
@@ -177,6 +139,87 @@ def traffic_line(server) -> str:
         return f"ترافیک خروجی: <b>{used:.2f} TB</b> از <b>{included:.2f} TB</b>"
     return f"ترافیک خروجی: <b>{used:.2f} TB</b>"
 
+
+
+def server_monthly_price_eur(server) -> float:
+    """Return Hetzner monthly price when exposed by hcloud API."""
+    try:
+        prices = getattr(getattr(server, "server_type", None), "prices", None) or []
+        if prices:
+            # Prefer matching location price.
+            loc = server_location(server)
+            for price in prices:
+                if getattr(getattr(price, "location", None), "name", "") == loc:
+                    return float(getattr(price, "price_monthly", 0) or 0)
+            return float(getattr(prices[0], "price_monthly", 0) or 0)
+    except Exception:
+        pass
+    return 0.0
+
+
+def cost_tracking_load() -> dict:
+    try:
+        if COST_TRACK_STATE_FILE.exists():
+            return json.loads(COST_TRACK_STATE_FILE.read_text())
+    except Exception:
+        pass
+    return {}
+
+
+def cost_tracking_save(data: dict) -> None:
+    try:
+        COST_TRACK_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        COST_TRACK_STATE_FILE.write_text(json.dumps(data))
+    except Exception:
+        pass
+
+
+def server_cost_line(server) -> str:
+    price = server_monthly_price_eur(server)
+    if price:
+        return f"💰 ماهانه: <b>€{price:.2f}</b>"
+    return ""
+
+
+def server_spent_so_far(server, price: float) -> float:
+    data = cost_tracking_load()
+    key = str(getattr(server, "id", server.name))
+    if key not in data:
+        data[key] = {"first_seen": datetime.now(timezone.utc).isoformat()}
+        cost_tracking_save(data)
+    try:
+        started = datetime.fromisoformat(data[key]["first_seen"])
+        days = max(0, (datetime.now(timezone.utc)-started).total_seconds()/86400)
+        return price * days / 30.0
+    except Exception:
+        return 0.0
+
+
+async def cost_report_text() -> str:
+    lines = ["📊 <b>گزارش هزینه ماهانه</b>", ""]
+    total = 0.0
+    for project in PROJECTS:
+        try:
+            servers = await asyncio.to_thread(project["client"].servers.get_all)
+        except Exception:
+            continue
+        project_total = 0.0
+        project_lines = []
+        for server in servers:
+            price = server_monthly_price_eur(server)
+            if price:
+                project_total += price
+                total += price
+                project_lines.append(f"🖥 {escape(server.name)}   €{price:.2f} | مصرف: €{server_spent_so_far(server, price):.2f}")
+        if project_lines:
+            lines.append(f"📁 <b>{escape(project['name'])}</b>")
+            lines.extend(project_lines)
+            lines.append(f"\nجمع پروژه: <b>€{project_total:.2f}</b>\n")
+    if not total:
+        lines.append("اطلاعات قیمت از API هتزنر دریافت نشد.")
+    else:
+        lines.append(f"💰 <b>کل همه پروژه‌ها: €{total:.2f}</b>")
+    return "\n".join(lines)
 
 def clip(text: str, limit: int = MAX_TEXT) -> str:
     if len(text) <= limit:
@@ -242,6 +285,7 @@ def main_keyboard() -> InlineKeyboardMarkup:
             [InlineKeyboardButton("📁 انتخاب پروژه", callback_data="projects")],
             [InlineKeyboardButton("💸 Cost-Optimized", callback_data="cheap:show")],
             [InlineKeyboardButton("📊 ترافیک همه پروژه‌ها", callback_data="traffic:all")],
+            [InlineKeyboardButton("💰 گزارش هزینه ماهانه", callback_data="cost:report")],
             [InlineKeyboardButton("ℹ️ راهنما", callback_data="help")],
         ]
     )
@@ -274,7 +318,8 @@ def server_text(server, project_name: str) -> str:
         f"IPv6: <code>{escape(str(ipv6))}</code>\n"
         f"پلن: <code>{escape(str(server_type))}</code> — {cores} vCPU / {memory} GB RAM / {disk} GB\n"
         f"موقعیت: <code>{escape(server_location(server))}</code>\n"
-        f"{cost_line(server)}\n"
+        f"{server_cost_line(server)}\n"
+        f"💳 مصرف تا الان: <b>€{server_spent_so_far(server, server_monthly_price_eur(server)):.2f}</b>\n"
         f"{traffic_line(server)}"
     )
 
@@ -754,12 +799,9 @@ async def show_create_plans(query, context: ContextTypes.DEFAULT_TYPE, pidx: int
     )
 
 def project_dashboard_text(project: dict, servers: list, fips: list) -> str:
-    monthly_total = sum(server_monthly_cost(s) for s in servers)
-    consumed_total = sum(server_consumed_cost(s) for s in servers)
-    cost_summary = f"   |   💰 €{consumed_total:.2f}/€{monthly_total:.2f}" if monthly_total else ""
     lines = [
         f"📁 <b>{escape(project['name'])}</b>",
-        f"🖥 سرورها: <b>{len(servers)}</b>   |   🌐 Floating IP: <b>{len(fips)}</b>{cost_summary}",
+        f"🖥 سرورها: <b>{len(servers)}</b>   |   🌐 Floating IP: <b>{len(fips)}</b>",
         "",
         "<b>سرورها:</b>",
     ]
@@ -771,12 +813,9 @@ def project_dashboard_text(project: dict, servers: list, fips: list) -> str:
             st = getattr(getattr(server, "server_type", None), "name", "?")
             ip = server_ipv4(server) or "بدون IPv4"
             used = traffic_tb(server)
-            monthly = server_monthly_cost(server)
-            consumed = server_consumed_cost(server)
-            cost = f" — €{consumed:.2f}/€{monthly:.2f}" if monthly else ""
             lines.append(
                 f"{idx}. {status_icon(status)} <b>{escape(server.name)}</b> — "
-                f"<code>{escape(str(st))}</code> — <code>{escape(str(ip))}</code> — {used:.2f} TB{cost}"
+                f"<code>{escape(str(st))}</code> — <code>{escape(str(ip))}</code> — {used:.2f} TB"
             )
     lines.extend(["", "از دکمه‌های زیر سرور یا بخش موردنظر را انتخاب کنید."])
     return "\n".join(lines)
@@ -796,6 +835,7 @@ def project_dashboard_keyboard(pidx: int, servers: list) -> InlineKeyboardMarkup
                 InlineKeyboardButton("🌐 Floating IP", callback_data=f"fips:{pidx}"),
             ],
             [InlineKeyboardButton("📊 ترافیک", callback_data=f"traffic:{pidx}")],
+            [InlineKeyboardButton("💰 هزینه ماهانه", callback_data="cost:report")],
             [InlineKeyboardButton("🔄 بروزرسانی پروژه", callback_data=f"project:{pidx}")],
             [InlineKeyboardButton("⬅️ پروژه‌ها", callback_data="projects")],
         ]
@@ -1583,6 +1623,10 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             await query.answer("در حال بررسی موجودی...")
             await show_cost_optimized(query)
             return
+        if data == "cheap:auto":
+            await query.answer()
+            await safe_edit(query, "🤖 <b>ساخت خودکار Cost-Optimized</b>\n\nبرای فعال کردن، مشخصات سرور در فایل تنظیمات خودکار ذخیره می‌شود و هر ۶۰ دقیقه موجودی بررسی می‌شود. این بخش مستقل از مانیتور Cost-Optimized است.", InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ برگشت", callback_data="cheap:show")]]))
+            return
         if data == "cheap:toggle":
             current = cost_monitor_enabled()
             new_state = not current
@@ -1592,6 +1636,10 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 query,
                 "✅ مانیتور Cost-Optimized روشن شد." if new_state else "⏸ مانیتور Cost-Optimized خاموش شد.",
             )
+            return
+        if data == "cost:report":
+            await query.answer()
+            await safe_edit(query, await cost_report_text(), InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ منوی اصلی", callback_data="main")]]))
             return
         if data.startswith("project:"):
             await query.answer()
@@ -2467,6 +2515,18 @@ async def cmd_traffic(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     )
 
 
+
+async def cmd_cost(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not authorized(update):
+        await deny(update)
+        return
+    await render_message(
+        update.effective_message,
+        await cost_report_text(),
+        InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ منوی اصلی", callback_data="main")]]),
+    )
+
+
 async def cmd_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not authorized(update):
         await deny(update)
@@ -2587,6 +2647,53 @@ async def traffic_alert_job(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 
+
+def read_auto_create_state() -> dict:
+    try:
+        if AUTO_CREATE_STATE_FILE.exists():
+            return json.loads(AUTO_CREATE_STATE_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        log.exception("Could not read auto create state")
+    return {}
+
+
+def write_auto_create_state(state: dict) -> None:
+    AUTO_CREATE_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    AUTO_CREATE_STATE_FILE.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+async def auto_create_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Independent Cost-Optimized reservation watcher. It does not depend on availability monitor."""
+    state = read_auto_create_state()
+    request = state.get("request")
+    if not request or state.get("created"):
+        return
+    try:
+        project = PROJECTS[int(request["project"])]
+        types = await asyncio.to_thread(project["client"].server_types.get_all)
+        st = next((x for x in types if x.name == request["server_type"]), None)
+        if not st:
+            return
+        loc = await asyncio.to_thread(project["client"].locations.get_by_name, request["location"])
+        if not loc:
+            return
+        image = await asyncio.to_thread(project["client"].images.get_by_name, request.get("image", "ubuntu-24.04"))
+        if not image:
+            return
+        result = await asyncio.to_thread(project["client"].servers.create,
+            name=request["name"], server_type=st, image=image,
+            location=loc, start_after_create=True)
+        state["created"] = True
+        write_auto_create_state(state)
+        await context.bot.send_message(
+            chat_id=int(ALLOWED_USER_ID),
+            text=(f"✅ ساخت خودکار انجام شد\n\n🖥 {escape(result.server.name)}\n"
+                  f"💸 پلن: {escape(st.name)}\n📍 {escape(loc.name)}"),
+            parse_mode=ParseMode.HTML)
+    except Exception:
+        log.exception("Auto create failed")
+
+
 def read_availability_state() -> dict:
     try:
         if AVAILABILITY_STATE_FILE.exists():
@@ -2668,6 +2775,7 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("servers", cmd_servers))
     app.add_handler(CommandHandler("traffic", cmd_traffic))
+    app.add_handler(CommandHandler("cost", cmd_cost))
     app.add_handler(CommandHandler("floating", cmd_floating))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("id", cmd_id))
@@ -2682,5 +2790,11 @@ if __name__ == "__main__":
         first=30,
         name="cost-optimized-availability",
     )
-    print(f"Hetzner Telegram Bot is running with {len(PROJECTS)} project(s)...")
+    app.job_queue.run_repeating(
+        auto_create_job,
+        interval=AUTO_CREATE_CHECK_MINUTES * 60,
+        first=60,
+        name="cost-auto-create",
+    )
+    print(f"Hetzner Telegram Bot v{BOT_VERSION} is running with {len(PROJECTS)} project(s)...")
     app.run_polling(drop_pending_updates=True)
