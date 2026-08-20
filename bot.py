@@ -38,7 +38,7 @@ TRAFFIC_ALERT_TB = (18.0, 19.0, 20.0)
 CHEAP_CHECK_HOURS = float(os.getenv("CHEAP_CHECK_HOURS", "1") or 1)
 STATE_FILE = Path(os.getenv("STATE_FILE", "/opt/hetzner-telegram-bot/.traffic_alert_state.json"))
 AVAILABILITY_STATE_FILE = Path(os.getenv("AVAILABILITY_STATE_FILE", "/opt/hetzner-telegram-bot/.cost_optimized_state.json"))
-BOT_VERSION = "14.1"
+BOT_VERSION = "14.3"
 COST_TRACK_STATE_FILE = Path(os.getenv("COST_TRACK_STATE_FILE", "/opt/hetzner-telegram-bot/.cost_tracking.json"))
 AUTO_CREATE_STATE_FILE = Path(os.getenv("AUTO_CREATE_STATE_FILE", "/opt/hetzner-telegram-bot/.cost_auto_create.json"))
 AUTO_CREATE_CHECK_MINUTES = int(os.getenv("AUTO_CREATE_CHECK_MINUTES", "60") or 60)
@@ -141,20 +141,36 @@ def traffic_line(server) -> str:
 
 
 
-def server_monthly_price_eur(server) -> float:
-    """Return Hetzner monthly price when exposed by hcloud API."""
+def _money_to_float(value) -> float:
+    """Convert hcloud Money/string/number values to EUR float."""
     try:
-        prices = getattr(getattr(server, "server_type", None), "prices", None) or []
+        if value is None:
+            return 0.0
+        amount = getattr(value, "amount", None)
+        if amount is not None:
+            return float(amount)
+        if isinstance(value, dict):
+            return float(value.get("amount", 0) or 0)
+        return float(value)
+    except Exception:
+        return 0.0
+
+
+def server_monthly_price_eur(server) -> float:
+    """Return Hetzner monthly price from server type pricing."""
+    try:
+        server_type = getattr(server, "server_type", None)
+        prices = getattr(server_type, "prices", None) or []
         if prices:
-            # Prefer matching location price.
             loc = server_location(server)
             for price in prices:
                 if getattr(getattr(price, "location", None), "name", "") == loc:
-                    return float(getattr(price, "price_monthly", 0) or 0)
-            return float(getattr(prices[0], "price_monthly", 0) or 0)
+                    return _money_to_float(getattr(price, "price_monthly", None))
+            return _money_to_float(getattr(prices[0], "price_monthly", None))
+        # fallback for cached server type objects
+        return _money_to_float(getattr(server_type, "price_monthly", None))
     except Exception:
-        pass
-    return 0.0
+        return 0.0
 
 
 def cost_tracking_load() -> dict:
@@ -569,6 +585,8 @@ async def show_cost_optimized(query, notice: str | None = None) -> None:
     text = cost_optimized_text(matrix)
     status = "🟢 روشن" if enabled else "🔴 خاموش"
     text += f"\n\n🔔 مانیتور: <b>{status}</b> — هر <b>{CHEAP_CHECK_HOURS:g} ساعت</b>"
+    auto = read_auto_create_state()
+    text += "\n🤖 ساخت خودکار: " + ("فعال" if auto.get("request") and not auto.get("created") else "غیرفعال")
     if notice:
         text = f"{escape(notice)}\n\n{text}"
 
@@ -582,6 +600,7 @@ async def show_cost_optimized(query, notice: str | None = None) -> None:
                     InlineKeyboardButton("🔄 بررسی دوباره", callback_data="cheap:show"),
                     InlineKeyboardButton(toggle_text, callback_data="cheap:toggle"),
                 ],
+                [InlineKeyboardButton("🤖 ساخت خودکار هنگام موجود شدن", callback_data="cheap:auto")],
                 [InlineKeyboardButton("📁 انتخاب پروژه برای ساخت", callback_data="projects")],
                 [InlineKeyboardButton("⬅️ منوی اصلی", callback_data="main")],
             ]
@@ -1625,7 +1644,7 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             return
         if data == "cheap:auto":
             await query.answer()
-            await safe_edit(query, "🤖 <b>ساخت خودکار Cost-Optimized</b>\n\nبرای فعال کردن، مشخصات سرور در فایل تنظیمات خودکار ذخیره می‌شود و هر ۶۰ دقیقه موجودی بررسی می‌شود. این بخش مستقل از مانیتور Cost-Optimized است.", InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ برگشت", callback_data="cheap:show")]]))
+            await safe_edit(query, "🤖 <b>ساخت خودکار Cost-Optimized</b>\n\nاین بخش جدا از مانیتور Cost-Optimized کار می‌کند.\n\nوقتی سفارش ساخت خودکار ثبت شود، حتی اگر مانیتور خاموش باشد، بررسی موجودی ادامه دارد و بعد از Available شدن سرور ساخته و اعلان ارسال می‌شود.", InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ برگشت", callback_data="cheap:show")]]))
             return
         if data == "cheap:toggle":
             current = cost_monitor_enabled()
