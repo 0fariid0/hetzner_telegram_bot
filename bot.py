@@ -38,7 +38,7 @@ TRAFFIC_ALERT_TB = (18.0, 19.0, 20.0)
 CHEAP_CHECK_HOURS = float(os.getenv("CHEAP_CHECK_HOURS", "1") or 1)
 STATE_FILE = Path(os.getenv("STATE_FILE", "/opt/hetzner-telegram-bot/.traffic_alert_state.json"))
 AVAILABILITY_STATE_FILE = Path(os.getenv("AVAILABILITY_STATE_FILE", "/opt/hetzner-telegram-bot/.cost_optimized_state.json"))
-BOT_VERSION = "14.7"
+BOT_VERSION = "15.0"
 COST_TRACK_STATE_FILE = Path(os.getenv("COST_TRACK_STATE_FILE", "/opt/hetzner-telegram-bot/.cost_tracking.json"))
 AUTO_CREATE_STATE_FILE = Path(os.getenv("AUTO_CREATE_STATE_FILE", "/opt/hetzner-telegram-bot/.cost_auto_create.json"))
 AUTO_CREATE_CHECK_MINUTES = int(os.getenv("AUTO_CREATE_CHECK_MINUTES", "60") or 60)
@@ -142,39 +142,39 @@ def traffic_line(server) -> str:
 
 
 def _money_to_float(value) -> float:
-    """Convert hcloud Money/string/number values to EUR float."""
+    """Convert hcloud Price objects/dicts/numbers safely to float."""
     try:
         if value is None:
             return 0.0
+        if isinstance(value, (int, float)):
+            return float(value)
         amount = getattr(value, "amount", None)
         if amount is not None:
             return float(amount)
         if isinstance(value, dict):
-            return float(value.get("amount", 0) or 0)
-        return float(value)
+            return float(value.get("amount") or value.get("value") or 0)
+        return float(str(value))
     except Exception:
         return 0.0
 
 
-def _money_to_float(value) -> float:
+def _price_monthly_from_entry(price):
+    """Handle hcloud versions where price_monthly shape changed."""
     try:
-        if value is None:
-            return 0.0
-        amount = getattr(value, "amount", None)
-        if amount is not None:
-            return float(amount)
-        if isinstance(value, dict):
-            return float(value.get("amount", 0) or 0)
-        return float(value)
+        monthly = getattr(price, "price_monthly", None)
+        if monthly is None and isinstance(price, dict):
+            monthly = price.get("price_monthly")
+        return _money_to_float(monthly)
     except Exception:
         return 0.0
 
 
 def server_monthly_price_eur(server, server_types=None) -> float:
-    """Resolve monthly price from Hetzner server type prices.
+    """Resolve monthly price with multiple fallbacks.
 
-    Server objects returned by hcloud do not always contain expanded price data.
-    Always resolve through /server_types and match the server location first.
+    v14 returned zero when hcloud price metadata shape or location matching
+    differed. This version checks id/name, location objects, dictionaries,
+    and finally logs the reason instead of silently failing.
     """
     try:
         st = getattr(server, "server_type", None)
@@ -186,26 +186,34 @@ def server_monthly_price_eur(server, server_types=None) -> float:
 
         prices = getattr(st, "prices", None) or []
         if not prices:
-            log.warning("No prices found for server type: %s", getattr(st, "name", "unknown"))
+            log.warning("No prices found for server %s type=%s", getattr(server, 'name', '?'), getattr(st, 'name', '?'))
             return 0.0
 
         loc = server_location(server)
+        normalized = str(loc).lower().replace("_", "-").strip()
+
         for price in prices:
-            price_loc = getattr(getattr(price, "location", None), "name", "")
-            monthly = _money_to_float(getattr(price, "price_monthly", None))
-            if price_loc == loc and monthly > 0:
-                return monthly
+            p_loc = getattr(getattr(price, "location", None), "name", None)
+            if p_loc is None and isinstance(price, dict):
+                p_loc = (price.get("location") or {}).get("name") if isinstance(price.get("location"), dict) else None
+            if p_loc and str(p_loc).lower().replace("_", "-").strip() == normalized:
+                value = _price_monthly_from_entry(price)
+                if value:
+                    return value
 
-        # hcloud versions differ: location can be returned as object or empty.
-        # Use any valid monthly price instead of reporting unavailable.
-        valid = [_money_to_float(getattr(p, "price_monthly", None)) for p in prices]
-        valid = [p for p in valid if p > 0]
-        if valid:
-            return valid[0]
+        # If only one regional price exists use it.
+        if len(prices) == 1:
+            return _price_monthly_from_entry(prices[0])
+
+        # Last safe fallback: first valid price.
+        for price in prices:
+            value = _price_monthly_from_entry(price)
+            if value:
+                return value
+
     except Exception:
-        pass
+        log.exception("Price resolution failed for server %s", getattr(server, 'name', '?'))
     return 0.0
-
 
 def cost_tracking_load() -> dict:
     try:
