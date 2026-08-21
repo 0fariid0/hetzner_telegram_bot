@@ -12,6 +12,14 @@ bash <(curl -fsSL --ipv4 https://raw.githubusercontent.com/0fariid0/hetzner_tele
 
 این دستور **مستقیماً نصب را شروع نمی‌کند**؛ ابتدا منوی مدیریتی Installer باز می‌شود و خودتان Install، Update، Token Management یا Service Management را انتخاب می‌کنید. ورودی‌های منو مستقیماً از ترمینال (`/dev/tty`) خوانده می‌شوند تا اجرای یک‌خطی هم همیشه تعاملی بماند.
 
+اگر ZIP این نسخه را دانلود کرده‌اید، آن را Extract کنید و از داخل پوشه اجرا کنید:
+
+```bash
+bash setup.sh
+```
+
+در این حالت Installer همان فایل‌های موجود در ZIP را پس از تطبیق سه نسخه و بررسی Syntax نصب می‌کند. اجرای یک‌خطی یا گزینه Update از نصب قبلی، بسته جدید را از مخزن دریافت می‌کند.
+
 بعد از اجرای دستور، منوی انگلیسی زیر باز می‌شود:
 
 ```text
@@ -115,6 +123,24 @@ Selected Project
 
 ```env
 CHEAP_CHECK_HOURS=1
+```
+
+## 🤖 ساخت خودکار مستقل Cost-Optimized
+
+از صفحه Cost-Optimized می‌توانید یک سفارش ساخت خودکار ثبت کنید:
+
+1. پروژه و Location را انتخاب کنید.
+2. یکی از پلن‌های Cost-Optimized همان Location را انتخاب کنید؛ پلن‌های ناموجود نیز با علامت انتظار نمایش داده می‌شوند.
+3. نام سرور، IPv6 و روش ورود (SSH Key یا رمز root) را مشخص کنید.
+4. سفارش را تأیید کنید.
+
+این Job مستقل از مانیتور اعلان موجودی اجرا می‌شود؛ خاموش بودن مانیتور مانع ساخت خودکار نیست. قبل از هر تلاش، Availability همان پلن در همان Location دوباره کنترل می‌شود. پس از ری‌استارت نیز سفارش حفظ می‌شود و ربات با بررسی نام سرور از ساخت تکراری جلوگیری می‌کند. فقط یک سفارش فعال نگهداری می‌شود و از همان صفحه قابل مشاهده یا لغو است.
+
+پیش‌فرض فاصله بررسی:
+
+```env
+AUTO_CREATE_CHECK_MINUTES=60
+AUTO_CREATE_STATE_FILE=/opt/hetzner-telegram-bot/.cost_auto_create.json
 ```
 
 ## 🔁 تعویض خودکار Primary IPv4
@@ -236,8 +262,9 @@ bash <(curl -fsSL --ipv4 https://raw.githubusercontent.com/0fariid0/hetzner_tele
 
 Update:
 
-- آخرین `bot.py` را دریافت می‌کند.
-- `setup.sh` را بروزرسانی می‌کند.
+- کل بسته `bot.py`، `setup.sh` و `VERSION` را ابتدا در مسیر موقت دریافت می‌کند.
+- قبل از جایگزینی، یکسان بودن نسخه‌ها و صحت Syntax فایل‌ها را کنترل می‌کند.
+- اگر دانلود یا اعتبارسنجی ناقص باشد، فایل‌های نصب‌شده دست‌نخورده می‌مانند.
 - وابستگی‌های Python را بروزرسانی می‌کند.
 - `.env` و تمام Tokenهای فعلی را حفظ می‌کند.
 - سرویس را Restart می‌کند.
@@ -277,17 +304,22 @@ TRAFFIC_CHECK_TIME=23:30
 CHEAP_CHECK_HOURS=1
 STATE_FILE=/opt/hetzner-telegram-bot/.traffic_alert_state.json
 AVAILABILITY_STATE_FILE=/opt/hetzner-telegram-bot/.cost_optimized_state.json
+AUTO_CREATE_STATE_FILE=/opt/hetzner-telegram-bot/.cost_auto_create.json
+AUTO_CREATE_CHECK_MINUTES=60
+HETZNER_PRICE_KIND=gross
+PRICE_CACHE_TTL_SECONDS=600
 ```
 
 ## 📂 ساختار پروژه
 
-پروژه همچنان فقط ۴ فایل اصلی دارد:
+پروژه فقط ۵ فایل دارد و وابستگی یا فایل اجرایی اضافه‌ای به سورس افزوده نشده است:
 
 ```text
 hetzner_telegram_bot/
 ├── bot.py
 ├── setup.sh
 ├── README.md
+├── VERSION
 └── .gitignore
 ```
 
@@ -304,7 +336,7 @@ hetzner_telegram_bot/
 
 ## 💰 قیمت ماهانه از Hetzner Pricing API
 
-قیمت ماهانه سرورها از endpoint رسمی `GET /v1/pricing` گرفته می‌شود و با `server_type` و `Location` همان سرور تطبیق داده می‌شود. این روش به‌جای اتکا به metadata قدیمی SDK، قیمت پروژه را مستقیماً از Hetzner می‌گیرد. API قیمت‌ها را با currency و هر دو مقدار net/gross برمی‌گرداند؛ تنظیم پیش‌فرض این نسخه `gross` است.
+قیمت ماهانه سرورها از endpoint رسمی `GET /v1/pricing` گرفته می‌شود و با `server_type` و `Location` همان سرور تطبیق داده می‌شود. هزینه Primary IPv4، Floating IP و Backup فعال نیز در صورت ارائه قیمت توسط API محاسبه می‌شود. API قیمت‌ها را با currency و هر دو مقدار net/gross برمی‌گرداند؛ تنظیم پیش‌فرض این نسخه `gross` است. در خطای موقت API، Retry انجام می‌شود و آخرین Cache موفق نیز به‌عنوان مسیر جایگزین قابل استفاده است.
 
 تنظیمات:
 
@@ -313,12 +345,20 @@ HETZNER_PRICE_KIND=gross
 PRICE_CACHE_TTL_SECONDS=600
 ```
 
-نسخه ربات، Installer و فایل `VERSION` در این Release همگی `16.0` هستند.
+نسخه ربات، Installer و فایل `VERSION` در این Release همگی `16.1` هستند.
 
 
-## نسخه 16.0
+## نسخه 16.1
+- ثبت، مشاهده و لغو سفارش واقعی ساخت خودکار Cost-Optimized از داخل ربات اضافه شد.
+- ساخت خودکار اکنون Location، Availability، معماری Ubuntu، IPv6 و SSH Key را درست اعمال می‌کند.
+- جلوگیری از ساخت تکراری پس از ری‌استارت یا قطع‌شدن Job اضافه شد.
+- باگ نام تعریف‌نشده در Retry قیمت‌گذاری و خواندن Money در مسیر جایگزین رفع شد.
+- درخواست قیمت‌گذاری از Thread اجرا می‌شود تا منوی تلگرام هنگام Retry قفل نشود.
+- محاسبه Backup فعال و خطاهای تفکیک‌شده هر پروژه به گزارش هزینه اضافه شد.
+- Update به‌صورت مرحله‌ای و پس از تطبیق نسخه و Syntax انجام می‌شود تا نصب نیمه‌کاره ایجاد نشود.
+- اجرای `setup.sh` داخل پوشه ZIP از همان بسته محلی استفاده می‌کند و به نسخه متفاوت مخزن سوییچ نمی‌کند.
 - محاسبه هزینه جاری بر اساس نرخ ساعتی Hetzner و سقف ماهانه انجام می‌شود.
 - Primary IPv4 آزاد و Floating IPهای دارای قیمت نیز در گزارش هزینه محاسبه می‌شوند.
 - قیمت Primary IPv4 بر اساس Location تطبیق داده می‌شود.
-- Installer و فایل VERSION روی 16.0 هماهنگ شده‌اند.
+- Installer و فایل VERSION روی 16.1 هماهنگ شده‌اند.
 - وابستگی hcloud حداقل نسخه 2.23 است.

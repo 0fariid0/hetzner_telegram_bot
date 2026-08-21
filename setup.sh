@@ -18,7 +18,17 @@ CYAN='\033[0;36m'
 BOLD='\033[1m'
 NC='\033[0m'
 
-INSTALLER_VERSION="16.0"
+INSTALLER_VERSION="16.1"
+LOCAL_RELEASE_DIR=""
+if [[ -f "${BASH_SOURCE[0]}" ]]; then
+  candidate_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+  if [[ "$candidate_dir" != "$APP_DIR" \
+        && -f "$candidate_dir/bot.py" \
+        && -f "$candidate_dir/setup.sh" \
+        && -f "$candidate_dir/VERSION" ]]; then
+    LOCAL_RELEASE_DIR="$candidate_dir"
+  fi
+fi
 TTY_FD=0
 if [[ -r /dev/tty && -w /dev/tty ]]; then
   exec 3<>/dev/tty
@@ -59,16 +69,42 @@ ensure_user_and_dir() {
   fi
 }
 
-download_file() {
-  local remote="$1" dest="$2" mode="${3:-0644}"
-  local tmp
-  tmp="$(mktemp)"
-  if ! curl -fsSL --ipv4 "${RAW_BASE}/${remote}" -o "$tmp"; then
-    rm -f "$tmp"
-    fail "Could not download ${remote} from ${RAW_BASE}"
+download_release_bundle() {
+  local stage remote downloaded_version downloaded_installer_version downloaded_bot_version
+  stage="$(mktemp -d)"
+  if [[ -n "$LOCAL_RELEASE_DIR" ]]; then
+    info "Using the validated files from ${LOCAL_RELEASE_DIR}"
+    for remote in bot.py setup.sh VERSION; do
+      cp -- "${LOCAL_RELEASE_DIR}/${remote}" "${stage}/${remote}"
+    done
+    [[ -f "${LOCAL_RELEASE_DIR}/README.md" ]] && cp -- "${LOCAL_RELEASE_DIR}/README.md" "${stage}/README.md"
+  else
+    for remote in bot.py setup.sh VERSION; do
+      if ! curl -fsSL --ipv4 "${RAW_BASE}/${remote}" -o "${stage}/${remote}"; then
+        rm -rf -- "$stage"
+        fail "Could not download ${remote} from ${RAW_BASE}"
+      fi
+    done
+    curl -fsSL --ipv4 "${RAW_BASE}/README.md" -o "${stage}/README.md" || true
   fi
-  $SUDO install -m "$mode" "$tmp" "$dest"
-  rm -f "$tmp"
+  downloaded_version="$(tr -d '[:space:]' < "${stage}/VERSION")"
+  downloaded_installer_version="$(sed -n 's/^INSTALLER_VERSION="\([^"]*\)"$/\1/p' "${stage}/setup.sh" | head -n1)"
+  downloaded_bot_version="$(sed -n 's/^BOT_VERSION = "\([^"]*\)"$/\1/p' "${stage}/bot.py" | head -n1)"
+  if [[ -z "$downloaded_installer_version" || -z "$downloaded_bot_version" \
+        || "$downloaded_version" != "$downloaded_installer_version" \
+        || "$downloaded_version" != "$downloaded_bot_version" ]]; then
+    rm -rf -- "$stage"
+    fail "Release mismatch: bot=${downloaded_bot_version:-missing}, installer=${downloaded_installer_version:-missing}, VERSION=${downloaded_version:-missing}. No files were changed."
+  fi
+  python3 -m py_compile "${stage}/bot.py" || { rm -rf -- "$stage"; fail "Downloaded bot.py failed syntax validation."; }
+  bash -n "${stage}/setup.sh" || { rm -rf -- "$stage"; fail "Downloaded setup.sh failed syntax validation."; }
+  $SUDO install -m 0644 "${stage}/bot.py" "$APP_DIR/bot.py"
+  $SUDO install -m 0755 "${stage}/setup.sh" "$APP_DIR/setup.sh"
+  $SUDO install -m 0644 "${stage}/VERSION" "$APP_DIR/VERSION"
+  if [[ -s "${stage}/README.md" ]]; then
+    $SUDO install -m 0644 "${stage}/README.md" "$APP_DIR/README.md"
+  fi
+  rm -rf -- "$stage"
 }
 
 install_python_deps() {
@@ -239,10 +275,7 @@ install_flow() {
   ensure_user_and_dir
 
   info "Downloading latest bot files..."
-  download_file "bot.py" "$APP_DIR/bot.py" 0644
-  download_file "setup.sh" "$APP_DIR/setup.sh" 0755
-  download_file "README.md" "$APP_DIR/README.md" 0644 || true
-  download_file "VERSION" "$APP_DIR/VERSION" 0644
+  download_release_bundle
   install_python_deps
 
   echo
@@ -267,7 +300,6 @@ TRAFFIC_CHECK_TIME=23:30
 CHEAP_CHECK_HOURS=1
 HETZNER_PRICE_KIND=gross
 PRICE_CACHE_TTL_SECONDS=600
-COST_TRACK_STATE_FILE=${APP_DIR}/.cost_tracking.json
 AUTO_CREATE_STATE_FILE=${APP_DIR}/.cost_auto_create.json
 AUTO_CREATE_CHECK_MINUTES=60
 STATE_FILE=${APP_DIR}/.traffic_alert_state.json
@@ -293,16 +325,19 @@ update_flow() {
   ensure_system_packages
   ensure_user_and_dir
   info "Downloading latest version..."
-  download_file "bot.py" "$APP_DIR/bot.py" 0644
-  download_file "setup.sh" "$APP_DIR/setup.sh" 0755
-  download_file "README.md" "$APP_DIR/README.md" 0644 || true
-  download_file "VERSION" "$APP_DIR/VERSION" 0644
+  download_release_bundle
   install_python_deps
   if [[ -z "$(read_env_value HETZNER_PRICE_KIND)" ]]; then
     set_env_value "HETZNER_PRICE_KIND" "gross"
   fi
   if [[ -z "$(read_env_value PRICE_CACHE_TTL_SECONDS)" ]]; then
     set_env_value "PRICE_CACHE_TTL_SECONDS" "600"
+  fi
+  if [[ -z "$(read_env_value AUTO_CREATE_STATE_FILE)" ]]; then
+    set_env_value "AUTO_CREATE_STATE_FILE" "${APP_DIR}/.cost_auto_create.json"
+  fi
+  if [[ -z "$(read_env_value AUTO_CREATE_CHECK_MINUTES)" ]]; then
+    set_env_value "AUTO_CREATE_CHECK_MINUTES" "60"
   fi
   write_service
   $SUDO chown -R "$BOT_USER:$BOT_USER" "$APP_DIR"
