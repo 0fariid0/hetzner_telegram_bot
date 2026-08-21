@@ -5,7 +5,7 @@ import json
 import logging
 import os
 import re
-from datetime import datetime, time
+from datetime import datetime, time, timezone
 from html import escape
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -38,7 +38,7 @@ TRAFFIC_ALERT_TB = (18.0, 19.0, 20.0)
 CHEAP_CHECK_HOURS = float(os.getenv("CHEAP_CHECK_HOURS", "1") or 1)
 STATE_FILE = Path(os.getenv("STATE_FILE", "/opt/hetzner-telegram-bot/.traffic_alert_state.json"))
 AVAILABILITY_STATE_FILE = Path(os.getenv("AVAILABILITY_STATE_FILE", "/opt/hetzner-telegram-bot/.cost_optimized_state.json"))
-BOT_VERSION = "14.4"
+BOT_VERSION = "14.6-fixed"
 COST_TRACK_STATE_FILE = Path(os.getenv("COST_TRACK_STATE_FILE", "/opt/hetzner-telegram-bot/.cost_tracking.json"))
 AUTO_CREATE_STATE_FILE = Path(os.getenv("AUTO_CREATE_STATE_FILE", "/opt/hetzner-telegram-bot/.cost_auto_create.json"))
 AUTO_CREATE_CHECK_MINUTES = int(os.getenv("AUTO_CREATE_CHECK_MINUTES", "60") or 60)
@@ -171,11 +171,7 @@ def _money_to_float(value) -> float:
 
 
 def server_monthly_price_eur(server, server_types=None) -> float:
-    """Resolve monthly price from Hetzner server type prices.
-
-    Server objects returned by hcloud do not always contain expanded price data.
-    Always resolve through /server_types and match the server location first.
-    """
+    """Resolve monthly price reliably from Hetzner server types."""
     try:
         st = getattr(server, "server_type", None)
         if server_types:
@@ -189,17 +185,22 @@ def server_monthly_price_eur(server, server_types=None) -> float:
             return 0.0
 
         loc = server_location(server)
-        # Prefer exact location price
+        # exact location match
         for price in prices:
-            price_loc = getattr(getattr(price, "location", None), "name", "")
-            if price_loc == loc:
-                return _money_to_float(getattr(price, "price_monthly", None))
+            ploc = getattr(getattr(price, "location", None), "name", "")
+            if ploc == loc:
+                value = _money_to_float(getattr(price, "price_monthly", None))
+                if value:
+                    return value
 
-        # Fallback only when Hetzner did not return location metadata
-        if len(prices) == 1:
-            return _money_to_float(getattr(prices[0], "price_monthly", None))
-    except Exception:
-        pass
+        # some hcloud versions return location objects differently
+        for price in prices:
+            value = _money_to_float(getattr(price, "price_monthly", None))
+            if value:
+                return value
+
+    except Exception as exc:
+        log.exception("price lookup failed: %s", exc)
     return 0.0
 
 
