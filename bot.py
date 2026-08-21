@@ -171,21 +171,32 @@ def _money_to_float(value) -> float:
 
 
 def server_monthly_price_eur(server, server_types=None) -> float:
-    """Get monthly price. hcloud server objects do not always contain prices."""
+    """Get monthly price from server type pricing. Some hcloud versions do not attach prices to server objects."""
     try:
         st = getattr(server, "server_type", None)
-        prices = getattr(st, "prices", None) or []
-        if not prices and server_types:
+        candidates = []
+        if st:
+            candidates.append(st)
+        if server_types:
             sid = getattr(st, "id", None)
             name = getattr(st, "name", None)
-            st = next((x for x in server_types if getattr(x, "id", None) == sid or getattr(x, "name", None) == name), None)
-            prices = getattr(st, "prices", None) or []
+            candidates.extend([
+                x for x in server_types
+                if (sid and getattr(x, "id", None) == sid) or (name and getattr(x, "name", None) == name)
+            ])
         loc = server_location(server)
-        for price in prices:
-            if getattr(getattr(price, "location", None), "name", "") == loc:
-                return _money_to_float(getattr(price, "price_monthly", None))
-        if prices:
-            return _money_to_float(getattr(prices[0], "price_monthly", None))
+        for item in candidates:
+            prices = getattr(item, "prices", None) or []
+            for price in prices:
+                location = getattr(getattr(price, "location", None), "name", "")
+                if location == loc:
+                    value = _money_to_float(getattr(price, "price_monthly", None))
+                    if value:
+                        return value
+            if prices:
+                value = _money_to_float(getattr(prices[0], "price_monthly", None))
+                if value:
+                    return value
     except Exception:
         pass
     return 0.0
