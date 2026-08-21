@@ -18,7 +18,7 @@ CYAN='\033[0;36m'
 BOLD='\033[1m'
 NC='\033[0m'
 
-INSTALLER_VERSION="15.1"
+INSTALLER_VERSION="16.0"
 TTY_FD=0
 if [[ -r /dev/tty && -w /dev/tty ]]; then
   exec 3<>/dev/tty
@@ -78,7 +78,7 @@ install_python_deps() {
   $SUDO "$APP_DIR/.venv/bin/python" -m pip install --upgrade pip
   $SUDO "$APP_DIR/.venv/bin/pip" install --upgrade \
     'python-telegram-bot[job-queue]>=20,<23' \
-    'hcloud>=2.22,<3' \
+    'hcloud>=2.23,<3' \
     'python-dotenv>=1,<2'
 }
 
@@ -267,6 +267,9 @@ TRAFFIC_CHECK_TIME=23:30
 CHEAP_CHECK_HOURS=1
 HETZNER_PRICE_KIND=gross
 PRICE_CACHE_TTL_SECONDS=600
+COST_TRACK_STATE_FILE=${APP_DIR}/.cost_tracking.json
+AUTO_CREATE_STATE_FILE=${APP_DIR}/.cost_auto_create.json
+AUTO_CREATE_CHECK_MINUTES=60
 STATE_FILE=${APP_DIR}/.traffic_alert_state.json
 AVAILABILITY_STATE_FILE=${APP_DIR}/.cost_optimized_state.json
 EOF

@@ -313,4 +313,12 @@ HETZNER_PRICE_KIND=gross
 PRICE_CACHE_TTL_SECONDS=600
 ```
 
-نسخه ربات، Installer و فایل `VERSION` در این Release همگی `15.1` هستند.
+نسخه ربات، Installer و فایل `VERSION` در این Release همگی `16.0` هستند.
+
+
+## نسخه 16.0
+- محاسبه هزینه جاری بر اساس نرخ ساعتی Hetzner و سقف ماهانه انجام می‌شود.
+- Primary IPv4 آزاد و Floating IPهای دارای قیمت نیز در گزارش هزینه محاسبه می‌شوند.
+- قیمت Primary IPv4 بر اساس Location تطبیق داده می‌شود.
+- Installer و فایل VERSION روی 16.0 هماهنگ شده‌اند.
+- وابستگی hcloud حداقل نسخه 2.23 است.

@@ -41,7 +41,7 @@ TRAFFIC_ALERT_TB = (18.0, 19.0, 20.0)
 CHEAP_CHECK_HOURS = float(os.getenv("CHEAP_CHECK_HOURS", "1") or 1)
 STATE_FILE = Path(os.getenv("STATE_FILE", "/opt/hetzner-telegram-bot/.traffic_alert_state.json"))
 AVAILABILITY_STATE_FILE = Path(os.getenv("AVAILABILITY_STATE_FILE", "/opt/hetzner-telegram-bot/.cost_optimized_state.json"))
-BOT_VERSION = "15.1"
+BOT_VERSION = "16.0"
 RELEASE_VERSION_FILE = Path(os.getenv("RELEASE_VERSION_FILE", "/opt/hetzner-telegram-bot/VERSION"))
 HETZNER_PRICE_KIND = os.getenv("HETZNER_PRICE_KIND", "gross").strip().lower() or "gross"
 PRICE_CACHE_TTL_SECONDS = int(os.getenv("PRICE_CACHE_TTL_SECONDS", "600") or 600)
@@ -188,7 +188,7 @@ _PRICE_CACHE: dict[str, tuple[float, dict]] = {}
 
 
 def _fetch_project_pricing(project: dict) -> dict | None:
-    """Fetch authoritative project pricing from Hetzner /v1/pricing with a short cache."""
+    """Fetch authoritative project pricing with a short cache and light retry on transient API errors."""
     token = str(project.get("token", "")).strip()
     if not token:
         return None
@@ -197,46 +197,103 @@ def _fetch_project_pricing(project: dict) -> dict | None:
     cached = _PRICE_CACHE.get(project_name)
     if cached and now - cached[0] < PRICE_CACHE_TTL_SECONDS:
         return cached[1]
-    try:
-        payload = _read_json("https://api.hetzner.cloud/v1/pricing", token)
-        pricing = payload.get("pricing")
-        if not isinstance(pricing, dict):
-            raise ValueError("pricing object missing")
-        _PRICE_CACHE[project_name] = (now, pricing)
-        return pricing
-    except (urllib.error.URLError, TimeoutError, ValueError, json.JSONDecodeError) as exc:
-        log.warning("Could not fetch Hetzner pricing for project %s: %s", project_name, exc)
-    except Exception:
-        log.exception("Unexpected pricing API failure for project %s", project_name)
+
+    last_exc = None
+    for attempt in range(3):
+        try:
+            payload = _read_json("https://api.hetzner.cloud/v1/pricing", token)
+            pricing = payload.get("pricing")
+            if not isinstance(pricing, dict):
+                raise ValueError("pricing object missing")
+            _PRICE_CACHE[project_name] = (monotonic_time.monotonic(), pricing)
+            return pricing
+        except urllib.error.HTTPError as exc:
+            last_exc = exc
+            if exc.code not in {429, 500, 502, 503, 504} or attempt == 2:
+                break
+            time.sleep(1.0 * (attempt + 1))
+        except (urllib.error.URLError, TimeoutError, ValueError, json.JSONDecodeError) as exc:
+            last_exc = exc
+            if attempt == 2:
+                break
+            time.sleep(0.5 * (attempt + 1))
+        except Exception as exc:
+            last_exc = exc
+            break
+    log.warning("Could not fetch Hetzner pricing for project %s: %s", project_name, last_exc)
+    return None
+
+
+def _normalized_location(value) -> str:
+    return str(value or "").lower().replace("_", "-").strip()
+
+
+def _pricing_server_entry(pricing: dict, server) -> dict | None:
+    server_type = getattr(server, "server_type", None)
+    server_type_id = getattr(server_type, "id", None)
+    server_type_name = str(getattr(server_type, "name", "") or "")
+    return next((
+        item for item in (pricing.get("server_types") or [])
+        if isinstance(item, dict) and (
+            (server_type_id is not None and item.get("id") == server_type_id)
+            or (server_type_name and item.get("name") == server_type_name)
+        )
+    ), None)
+
+
+def _pricing_server_price(pricing: dict, server) -> dict | None:
+    """Resolve server pricing by exact server type and Location."""
+    entry = _pricing_server_entry(pricing, server)
+    if not entry:
+        return None
+    normalized = _normalized_location(server_location(server))
+    candidate = next((
+        price for price in (entry.get("prices") or [])
+        if isinstance(price, dict) and _normalized_location(price.get("location")) == normalized
+    ), None)
+    if not isinstance(candidate, dict):
+        return None
+    currency = str(pricing.get("currency") or "EUR").upper()
+    return {
+        "monthly": _money_to_float((candidate.get("price_monthly") or {}).get(_configured_price_kind())),
+        "hourly": _money_to_float((candidate.get("price_hourly") or {}).get(_configured_price_kind())),
+        "currency": currency,
+    }
+
+
+def _pricing_ip_price(pricing: dict, ip, key: str) -> dict | None:
+    """Resolve Primary/Floating IP pricing by type and location."""
+    ip_type = str(getattr(ip, "type", "") or "").lower()
+    location = _normalized_location(primary_ip_location(ip) if key == "primary_ips" else getattr(getattr(ip, "home_location", None), "name", None) or getattr(getattr(ip, "location", None), "name", None))
+    for item in pricing.get(key) or []:
+        if not isinstance(item, dict):
+            continue
+        item_type = str(item.get("type", "") or "").lower()
+        if item_type and item_type not in {ip_type, "primary_" + ip_type}:
+            continue
+        prices = item.get("prices") or []
+        candidate = None
+        if location:
+            candidate = next((x for x in prices if isinstance(x, dict) and _normalized_location(x.get("location")) == location), None)
+        if candidate is None and len(prices) == 1:
+            candidate = prices[0]
+        if not isinstance(candidate, dict):
+            continue
+        monthly = candidate.get("price_monthly") or {}
+        hourly = candidate.get("price_hourly") or {}
+        return {
+            "monthly": _money_to_float(monthly.get(_configured_price_kind())),
+            "hourly": _money_to_float(hourly.get(_configured_price_kind())),
+            "currency": str(pricing.get("currency") or "EUR").upper(),
+        }
     return None
 
 
 def _pricing_server_monthly(pricing: dict, server) -> tuple[float, str] | None:
-    """Resolve monthly price by exact server type and Location."""
-    server_type = getattr(server, "server_type", None)
-    server_type_id = getattr(server_type, "id", None)
-    server_type_name = str(getattr(server_type, "name", "") or "")
-    location_name = server_location(server)
-    entry = next((
-        item for item in (pricing.get("server_types") or [])
-        if (server_type_id is not None and item.get("id") == server_type_id)
-        or (server_type_name and item.get("name") == server_type_name)
-    ), None)
-    if not isinstance(entry, dict):
+    price = _pricing_server_price(pricing, server)
+    if not price or price["monthly"] <= 0:
         return None
-    prices = entry.get("prices") or []
-    normalized = str(location_name).lower().replace("_", "-").strip()
-    candidate = next((
-        price for price in prices
-        if str(price.get("location", "")).lower().replace("_", "-").strip() == normalized
-    ), None)
-    if not isinstance(candidate, dict):
-        return None
-    monthly = candidate.get("price_monthly") or {}
-    amount = _money_to_float(monthly.get(_configured_price_kind()))
-    if amount <= 0:
-        return None
-    return amount, str(pricing.get("currency") or "EUR").upper()
+    return price["monthly"], price["currency"]
 
 
 def _fallback_server_monthly_price(server, server_types=None) -> tuple[float, str] | None:
@@ -276,37 +333,56 @@ def server_monthly_price_info(project: dict, server, server_types=None) -> tuple
     return _fallback_server_monthly_price(server, server_types)
 
 
-def _pricing_primary_ipv4_monthly(pricing: dict) -> tuple[float, str] | None:
-    """Return the monthly price of one Primary IPv4 for this project."""
-    for item in pricing.get("primary_ips") or []:
-        if str(item.get("type", "")).lower() not in {"ipv4", "primary_ipv4"}:
-            continue
-        prices = item.get("prices") or []
-        if not prices:
-            continue
-        monthly = (prices[0].get("price_monthly") or {})
-        amount = _money_to_float(monthly.get(_configured_price_kind()))
-        if amount > 0:
-            return amount, str(pricing.get("currency") or "EUR").upper()
+def _pricing_primary_ipv4_monthly(pricing: dict, ip=None) -> tuple[float, str] | None:
+    """Return the monthly price of one Primary IPv4 for this project/location."""
+    if ip is None:
+        class _IP:
+            type = "ipv4"
+            location = None
+        ip = _IP()
+    price = _pricing_ip_price(pricing, ip, "primary_ips")
+    if price and price["monthly"] > 0:
+        return price["monthly"], price["currency"]
     return None
 
 
+def _price_pair_to_public(price: dict | None) -> tuple[float, str] | None:
+    if not price or price.get("monthly", 0) <= 0:
+        return None
+    return float(price["monthly"]), str(price["currency"])
+
+
 def server_cost_components(project: dict, server, server_types=None) -> dict:
-    """Return server + Primary IPv4 monthly costs and currency."""
-    info = server_monthly_price_info(project, server, server_types)
-    result = {
-        "server": info,
-        "ipv4": None,
-        "total": None,
-    }
+    """Return server + its assigned Primary IPv4 monthly/hourly costs."""
     pricing = _fetch_project_pricing(project)
+    server_price = _pricing_server_price(pricing, server) if pricing else None
+    info = _price_pair_to_public(server_price)
+    if info is None:
+        info = server_monthly_price_info(project, server, server_types)
+        server_price = {"monthly": info[0], "hourly": 0.0, "currency": info[1]} if info else None
+
+    result = {"server": info, "ipv4": None, "total": None, "hourly_total": None, "monthly_total": None}
     if pricing and server_ipv4(server):
-        result["ipv4"] = _pricing_primary_ipv4_monthly(pricing)
-    if info:
-        total_amount, currency = info
+        result["ipv4"] = _pricing_primary_ipv4_monthly(pricing, type("IPView", (), {
+            "type": "ipv4", "location": getattr(server, "location", None)
+        })())
+        ip_price = _pricing_ip_price(pricing, type("IPView", (), {
+            "type": "ipv4", "location": getattr(server, "location", None)
+        })(), "primary_ips")
+    else:
+        ip_price = None
+
+    if server_price:
+        currency = server_price["currency"]
+        monthly = server_price["monthly"]
+        hourly = server_price.get("hourly", 0.0)
         if result["ipv4"] and result["ipv4"][1] == currency:
-            total_amount += result["ipv4"][0]
-        result["total"] = (total_amount, currency)
+            monthly += result["ipv4"][0]
+            if ip_price:
+                hourly += ip_price.get("hourly", 0.0)
+        result["total"] = (monthly, currency)
+        result["monthly_total"] = monthly
+        result["hourly_total"] = hourly
     return result
 
 
@@ -348,99 +424,166 @@ def _month_bounds(now: datetime) -> tuple[datetime, datetime]:
     return start, next_start
 
 
-def server_spent_so_far(server, monthly_cost: float, now: datetime | None = None) -> float:
-    """Estimate current-month usage from the actual server creation timestamp."""
-    now = now or datetime.now(timezone.utc)
-    month_start, next_month = _month_bounds(now)
-    created_raw = getattr(server, "created", None)
-    created = created_raw if isinstance(created_raw, datetime) else month_start
+def _resource_cost_so_far(created_raw, monthly_cost: float, hourly_cost: float, now: datetime) -> float:
+    created = created_raw if isinstance(created_raw, datetime) else now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
     if created.tzinfo is None:
         created = created.replace(tzinfo=timezone.utc)
+    month_start, _ = _month_bounds(now)
     bill_start = max(created, month_start)
     if bill_start >= now:
         return 0.0
-    total_hours = (next_month - month_start).total_seconds() / 3600.0
-    used_hours = min(total_hours, max(0.0, (now - bill_start).total_seconds() / 3600.0))
-    return min(monthly_cost, monthly_cost * used_hours / total_hours)
-
-
-def server_month_end_estimate(monthly_cost: float, now: datetime | None = None) -> float:
-    """Project the month-end cost based on current elapsed month and monthly cap."""
-    now = now or datetime.now(timezone.utc)
+    hours = max(0.0, (now - bill_start).total_seconds() / 3600.0)
     month_start, next_month = _month_bounds(now)
-    elapsed = max(1.0, (now - month_start).total_seconds())
-    total = max(1.0, (next_month - month_start).total_seconds())
-    return min(monthly_cost, monthly_cost * elapsed / total)
+    month_hours = (next_month - month_start).total_seconds() / 3600.0
+    rate = hourly_cost if hourly_cost > 0 else (monthly_cost / month_hours if month_hours else 0.0)
+    return min(monthly_cost, rate * hours)
+
+
+def _resource_cost_to_month_end(created_raw, monthly_cost: float, hourly_cost: float, now: datetime) -> float:
+    created = created_raw if isinstance(created_raw, datetime) else now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    if created.tzinfo is None:
+        created = created.replace(tzinfo=timezone.utc)
+    _, next_month = _month_bounds(now)
+    bill_start = max(created, now.replace(day=1, hour=0, minute=0, second=0, microsecond=0))
+    if bill_start >= next_month:
+        return 0.0
+    hours = max(0.0, (next_month - bill_start).total_seconds() / 3600.0)
+    month_hours = (_month_bounds(now)[1] - _month_bounds(now)[0]).total_seconds() / 3600.0
+    rate = hourly_cost if hourly_cost > 0 else monthly_cost / month_hours
+    return min(monthly_cost, rate * hours)
+
+
+def server_spent_so_far(server, monthly_cost: float, now: datetime | None = None, hourly_cost: float = 0.0) -> float:
+    """Estimate billed cost this month using Hetzner hourly pricing when available."""
+    return _resource_cost_so_far(getattr(server, "created", None), monthly_cost, hourly_cost, now or datetime.now(timezone.utc))
+
+
+def server_month_end_estimate(monthly_cost: float, now: datetime | None = None, hourly_cost: float = 0.0, created=None) -> float:
+    """Estimate end-of-month cost, capped at the configured monthly price."""
+    return _resource_cost_to_month_end(created, monthly_cost, hourly_cost, now or datetime.now(timezone.utc))
 
 
 async def cost_report_text() -> str:
     now = datetime.now(timezone.utc)
-    month_start, next_month = _month_bounds(now)
     day_text = now.strftime("%Y/%m/%d")
     lines = [
         "📊 <b>گزارش هزینه Hetzner</b>",
         "",
         f"📅 تاریخ گزارش: <b>{day_text}</b>",
         f"💳 نوع قیمت: <b>{'Gross (با مالیات)' if _configured_price_kind() == 'gross' else 'Net (بدون مالیات)'}</b>",
-        "📡 مرجع قیمت: <b>Hetzner Pricing API</b>",
+        "📡 مرجع: <b>Hetzner Pricing API</b>",
         "",
     ]
     totals = {"monthly": {}, "spent": {}, "estimate": {}}
     for project in PROJECTS:
+        client = project["client"]
         try:
-            servers = await asyncio.to_thread(project["client"].servers.get_all)
+            servers, primary_ips, floating_ips = await asyncio.gather(
+                asyncio.to_thread(client.servers.get_all),
+                asyncio.to_thread(client.primary_ips.get_all),
+                asyncio.to_thread(client.floating_ips.get_all),
+            )
         except Exception:
+            log.exception("Cost report resource fetch failed for project %s", project["name"])
             continue
-        project_lines = []
-        project_totals = {"monthly": {}, "spent": {}, "estimate": {}}
         try:
-            server_types = await asyncio.to_thread(project["client"].server_types.get_all)
+            server_types = await asyncio.to_thread(client.server_types.get_all)
         except Exception:
             server_types = []
+        pricing = _fetch_project_pricing(project)
+        project_totals = {"monthly": {}, "spent": {}, "estimate": {}}
+        project_lines = []
+
+        def add_total(kind, amount, currency):
+            project_totals[kind][currency] = project_totals[kind].get(currency, 0.0) + amount
+            totals[kind][currency] = totals[kind].get(currency, 0.0) + amount
+
         for server in servers:
             components = server_cost_components(project, server, server_types)
             if not components["total"]:
                 continue
             monthly, currency = components["total"]
-            spent = server_spent_so_far(server, monthly, now)
-            estimate = server_month_end_estimate(monthly, now)
+            hourly = float(components.get("hourly_total") or 0.0)
+            spent = server_spent_so_far(server, monthly, now, hourly)
+            estimate = server_month_end_estimate(monthly, now, hourly, getattr(server, "created", None))
             project_lines.extend([
                 f"🖥 <b>{escape(server.name)}</b>",
-                f"   📍 موقعیت: <code>{escape(server_location(server))}</code>",
+                f"   📍 Location: <code>{escape(server_location(server))}</code>",
                 f"   🧩 پلن: <code>{escape(str(getattr(getattr(server, 'server_type', None), 'name', 'نامشخص')))}</code>",
-                f"   💰 هزینه ماهانه: <b>{format_money(monthly, currency)}</b>",
-                f"   📈 مصرف تا الان: <b>{format_money(spent, currency)}</b>",
-                f"   📅 برآورد پایان ماه: <b>{format_money(estimate, currency)}</b>",
+                f"   💰 ماهانه: <b>{format_money(monthly, currency)}</b>",
+                f"   📈 تا الان: <b>{format_money(spent, currency)}</b>",
+                f"   📅 پایان ماه: <b>{format_money(estimate, currency)}</b>",
                 "",
             ])
-            for key, value in (("monthly", monthly), ("spent", spent), ("estimate", estimate)):
-                project_totals[key][currency] = project_totals[key].get(currency, 0.0) + value
-                totals[key][currency] = totals[key].get(currency, 0.0) + value
+            add_total("monthly", monthly, currency)
+            add_total("spent", spent, currency)
+            add_total("estimate", estimate, currency)
+
+        assigned_primary_ids = {getattr(s, "id", None) for s in servers for _ in [0]}
+        # Assigned Primary IPs are already included in each server's total. Only add unassigned billable IPv4s here.
+        for ip in primary_ips:
+            if str(getattr(ip, "type", "")).lower() != "ipv4" or getattr(ip, "assignee_id", None) is not None:
+                continue
+            if not pricing:
+                continue
+            ip_price = _pricing_ip_price(pricing, ip, "primary_ips")
+            if not ip_price or ip_price["monthly"] <= 0:
+                continue
+            monthly = ip_price["monthly"]
+            currency = ip_price["currency"]
+            spent = _resource_cost_so_far(getattr(ip, "created", None), monthly, ip_price.get("hourly", 0.0), now)
+            estimate = _resource_cost_to_month_end(getattr(ip, "created", None), monthly, ip_price.get("hourly", 0.0), now)
+            project_lines.extend([
+                f"🌐 <b>Primary IPv4 آزاد — {escape(str(ip.ip))}</b>",
+                f"   📍 Location: <code>{escape(primary_ip_location(ip))}</code>",
+                f"   💰 ماهانه: <b>{format_money(monthly, currency)}</b>",
+                f"   📈 تا الان: <b>{format_money(spent, currency)}</b>",
+                f"   📅 پایان ماه: <b>{format_money(estimate, currency)}</b>",
+                "",
+            ])
+            add_total("monthly", monthly, currency)
+            add_total("spent", spent, currency)
+            add_total("estimate", estimate, currency)
+
+        # Floating IPs are billed independently from servers. Add them when the project pricing API exposes a positive price.
+        if pricing:
+            for fip in floating_ips:
+                fip_price = _pricing_ip_price(pricing, fip, "floating_ips")
+                if not fip_price or fip_price["monthly"] <= 0:
+                    continue
+                monthly = fip_price["monthly"]
+                currency = fip_price["currency"]
+                spent = _resource_cost_so_far(getattr(fip, "created", None), monthly, fip_price.get("hourly", 0.0), now)
+                estimate = _resource_cost_to_month_end(getattr(fip, "created", None), monthly, fip_price.get("hourly", 0.0), now)
+                project_lines.extend([
+                    f"🌐 <b>Floating IP — {escape(str(getattr(fip, 'name', None) or fip.ip))}</b>",
+                    f"   IP: <code>{escape(str(fip.ip))}</code>",
+                    f"   💰 ماهانه: <b>{format_money(monthly, currency)}</b>",
+                    f"   📈 تا الان: <b>{format_money(spent, currency)}</b>",
+                    f"   📅 پایان ماه: <b>{format_money(estimate, currency)}</b>",
+                    "",
+                ])
+                add_total("monthly", monthly, currency)
+                add_total("spent", spent, currency)
+                add_total("estimate", estimate, currency)
+
         if project_lines:
             lines.append(f"📁 <b>{escape(project['name'])}</b>")
             lines.extend(project_lines)
-            monthly_summary = " | ".join(format_money(v, c) for c, v in sorted(project_totals["monthly"].items()))
-            spent_summary = " | ".join(format_money(v, c) for c, v in sorted(project_totals["spent"].items()))
-            estimate_summary = " | ".join(format_money(v, c) for c, v in sorted(project_totals["estimate"].items()))
-            lines.extend([
-                f"💼 <b>جمع پروژه {escape(project['name'])}</b>",
-                f"   💰 ماهانه: <b>{monthly_summary}</b>",
-                f"   📈 مصرف تا الان: <b>{spent_summary}</b>",
-                f"   📅 برآورد پایان ماه: <b>{estimate_summary}</b>",
-                "",
-            ])
+            for title, key, icon in (("جمع پروژه", "monthly", "💰"), ("مصرف تا الان", "spent", "📈"), ("برآورد پایان ماه", "estimate", "📅")):
+                summary = " | ".join(format_money(v, c) for c, v in sorted(project_totals[key].items())) or "€0.00"
+                lines.append(f"   {icon} <b>{title}: {summary}</b>")
+            lines.append("")
+
     if not totals["monthly"]:
-        lines.append("❌ اطلاعات قیمت از API هتزنر دریافت نشد.")
+        lines.append("❌ اطلاعات قیمت یا منابع قابل محاسبه از Hetzner دریافت نشد.")
     else:
-        monthly_summary = " | ".join(format_money(v, c) for c, v in sorted(totals["monthly"].items()))
-        spent_summary = " | ".join(format_money(v, c) for c, v in sorted(totals["spent"].items()))
-        estimate_summary = " | ".join(format_money(v, c) for c, v in sorted(totals["estimate"].items()))
         lines.extend([
             "━━━━━━━━━━━━━━━━━━━━",
             "💰 <b>جمع کل همه پروژه‌ها</b>",
-            f"   💳 هزینه ماهانه: <b>{monthly_summary}</b>",
-            f"   📈 مصرف تا الان: <b>{spent_summary}</b>",
-            f"   📅 برآورد پایان ماه: <b>{estimate_summary}</b>",
+            f"💳 ماهانه: <b>{' | '.join(format_money(v, c) for c, v in sorted(totals['monthly'].items()))}</b>",
+            f"📈 تا الان: <b>{' | '.join(format_money(v, c) for c, v in sorted(totals['spent'].items()))}</b>",
+            f"📅 پایان ماه: <b>{' | '.join(format_money(v, c) for c, v in sorted(totals['estimate'].items()))}</b>",
         ])
     return "\n".join(lines)
 
