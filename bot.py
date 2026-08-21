@@ -276,8 +276,42 @@ def server_monthly_price_info(project: dict, server, server_types=None) -> tuple
     return _fallback_server_monthly_price(server, server_types)
 
 
+def _pricing_primary_ipv4_monthly(pricing: dict) -> tuple[float, str] | None:
+    """Return the monthly price of one Primary IPv4 for this project."""
+    for item in pricing.get("primary_ips") or []:
+        if str(item.get("type", "")).lower() not in {"ipv4", "primary_ipv4"}:
+            continue
+        prices = item.get("prices") or []
+        if not prices:
+            continue
+        monthly = (prices[0].get("price_monthly") or {})
+        amount = _money_to_float(monthly.get(_configured_price_kind()))
+        if amount > 0:
+            return amount, str(pricing.get("currency") or "EUR").upper()
+    return None
+
+
+def server_cost_components(project: dict, server, server_types=None) -> dict:
+    """Return server + Primary IPv4 monthly costs and currency."""
+    info = server_monthly_price_info(project, server, server_types)
+    result = {
+        "server": info,
+        "ipv4": None,
+        "total": None,
+    }
+    pricing = _fetch_project_pricing(project)
+    if pricing and server_ipv4(server):
+        result["ipv4"] = _pricing_primary_ipv4_monthly(pricing)
+    if info:
+        total_amount, currency = info
+        if result["ipv4"] and result["ipv4"][1] == currency:
+            total_amount += result["ipv4"][0]
+        result["total"] = (total_amount, currency)
+    return result
+
+
 def server_monthly_price_eur(server, server_types=None, project: dict | None = None) -> float:
-    """Compatibility helper returning only the numeric monthly price."""
+    """Compatibility helper returning only the numeric monthly server price."""
     info = server_monthly_price_info(project, server, server_types) if project else _fallback_server_monthly_price(server, server_types)
     return float(info[0]) if info else 0.0
 
@@ -289,86 +323,125 @@ def format_money(amount: float, currency: str) -> str:
 
 
 def server_cost_line(project: dict, server, server_types=None) -> str:
-    info = server_monthly_price_info(project, server, server_types)
+    components = server_cost_components(project, server, server_types)
+    info = components["server"]
     if not info:
         return "💰 ماهانه: <b>نامشخص</b>"
     amount, currency = info
-    kind_fa = "با مالیات" if _configured_price_kind() == "gross" else "بدون مالیات"
-    return f"💰 ماهانه: <b>{format_money(amount, currency)}</b> ({kind_fa})"
-
-def cost_tracking_load() -> dict:
-    try:
-        if COST_TRACK_STATE_FILE.exists():
-            return json.loads(COST_TRACK_STATE_FILE.read_text())
-    except Exception:
-        pass
-    return {}
-
-
-def cost_tracking_save(data: dict) -> None:
-    try:
-        COST_TRACK_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-        COST_TRACK_STATE_FILE.write_text(json.dumps(data))
-    except Exception:
-        pass
+    kind_fa = "با مالیات (Gross)" if _configured_price_kind() == "gross" else "بدون مالیات (Net)"
+    lines = [f"🖥 هزینه سرور: <b>{format_money(amount, currency)}</b>", f"🧾 نوع قیمت: <b>{kind_fa}</b>"]
+    if components["ipv4"]:
+        ip_amount, ip_currency = components["ipv4"]
+        lines.insert(1, f"🌐 Primary IPv4: <b>{format_money(ip_amount, ip_currency)}</b>")
+    if components["total"]:
+        total_amount, total_currency = components["total"]
+        lines.append(f"📌 هزینه ماهانه این سرور: <b>{format_money(total_amount, total_currency)}</b>")
+    return "\n".join(lines)
 
 
+def _month_bounds(now: datetime) -> tuple[datetime, datetime]:
+    start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    if start.month == 12:
+        next_start = start.replace(year=start.year + 1, month=1)
+    else:
+        next_start = start.replace(month=start.month + 1)
+    return start, next_start
 
-def server_spent_so_far(server, price: float) -> float:
-    data = cost_tracking_load()
-    key = str(getattr(server, "id", server.name))
-    if key not in data:
-        data[key] = {"first_seen": datetime.now(timezone.utc).isoformat()}
-        cost_tracking_save(data)
-    try:
-        started = datetime.fromisoformat(data[key]["first_seen"])
-        days = max(0, (datetime.now(timezone.utc)-started).total_seconds()/86400)
-        return price * days / 30.0
-    except Exception:
+
+def server_spent_so_far(server, monthly_cost: float, now: datetime | None = None) -> float:
+    """Estimate current-month usage from the actual server creation timestamp."""
+    now = now or datetime.now(timezone.utc)
+    month_start, next_month = _month_bounds(now)
+    created_raw = getattr(server, "created", None)
+    created = created_raw if isinstance(created_raw, datetime) else month_start
+    if created.tzinfo is None:
+        created = created.replace(tzinfo=timezone.utc)
+    bill_start = max(created, month_start)
+    if bill_start >= now:
         return 0.0
+    total_hours = (next_month - month_start).total_seconds() / 3600.0
+    used_hours = min(total_hours, max(0.0, (now - bill_start).total_seconds() / 3600.0))
+    return min(monthly_cost, monthly_cost * used_hours / total_hours)
+
+
+def server_month_end_estimate(monthly_cost: float, now: datetime | None = None) -> float:
+    """Project the month-end cost based on current elapsed month and monthly cap."""
+    now = now or datetime.now(timezone.utc)
+    month_start, next_month = _month_bounds(now)
+    elapsed = max(1.0, (now - month_start).total_seconds())
+    total = max(1.0, (next_month - month_start).total_seconds())
+    return min(monthly_cost, monthly_cost * elapsed / total)
 
 
 async def cost_report_text() -> str:
+    now = datetime.now(timezone.utc)
+    month_start, next_month = _month_bounds(now)
+    day_text = now.strftime("%Y/%m/%d")
     lines = [
-        "📊 <b>گزارش هزینه ماهانه</b>",
+        "📊 <b>گزارش هزینه Hetzner</b>",
         "",
-        f"نوع قیمت: <b>{'با مالیات (Gross)' if _configured_price_kind() == 'gross' else 'بدون مالیات (Net)'}</b>",
-        "مرجع قیمت: <b>Hetzner Pricing API</b>",
+        f"📅 تاریخ گزارش: <b>{day_text}</b>",
+        f"💳 نوع قیمت: <b>{'Gross (با مالیات)' if _configured_price_kind() == 'gross' else 'Net (بدون مالیات)'}</b>",
+        "📡 مرجع قیمت: <b>Hetzner Pricing API</b>",
         "",
     ]
-    totals: dict[str, float] = {}
+    totals = {"monthly": {}, "spent": {}, "estimate": {}}
     for project in PROJECTS:
         try:
             servers = await asyncio.to_thread(project["client"].servers.get_all)
         except Exception:
             continue
         project_lines = []
-        project_totals: dict[str, float] = {}
+        project_totals = {"monthly": {}, "spent": {}, "estimate": {}}
         try:
             server_types = await asyncio.to_thread(project["client"].server_types.get_all)
         except Exception:
             server_types = []
         for server in servers:
-            info = server_monthly_price_info(project, server, server_types)
-            if not info:
+            components = server_cost_components(project, server, server_types)
+            if not components["total"]:
                 continue
-            price, currency = info
-            project_totals[currency] = project_totals.get(currency, 0.0) + price
-            totals[currency] = totals.get(currency, 0.0) + price
-            spent = server_spent_so_far(server, price)
-            project_lines.append(
-                f"🖥 {escape(server.name)}   {format_money(price, currency)} | برآورد مصرف: {format_money(spent, currency)}"
-            )
+            monthly, currency = components["total"]
+            spent = server_spent_so_far(server, monthly, now)
+            estimate = server_month_end_estimate(monthly, now)
+            project_lines.extend([
+                f"🖥 <b>{escape(server.name)}</b>",
+                f"   📍 موقعیت: <code>{escape(server_location(server))}</code>",
+                f"   🧩 پلن: <code>{escape(str(getattr(getattr(server, 'server_type', None), 'name', 'نامشخص')))}</code>",
+                f"   💰 هزینه ماهانه: <b>{format_money(monthly, currency)}</b>",
+                f"   📈 مصرف تا الان: <b>{format_money(spent, currency)}</b>",
+                f"   📅 برآورد پایان ماه: <b>{format_money(estimate, currency)}</b>",
+                "",
+            ])
+            for key, value in (("monthly", monthly), ("spent", spent), ("estimate", estimate)):
+                project_totals[key][currency] = project_totals[key].get(currency, 0.0) + value
+                totals[key][currency] = totals[key].get(currency, 0.0) + value
         if project_lines:
             lines.append(f"📁 <b>{escape(project['name'])}</b>")
             lines.extend(project_lines)
-            summary = " | ".join(format_money(v, c) for c, v in sorted(project_totals.items()))
-            lines.append(f"\nجمع پروژه: <b>{summary}</b>\n")
-    if not totals:
-        lines.append("اطلاعات قیمت از API هتزنر دریافت نشد.")
+            monthly_summary = " | ".join(format_money(v, c) for c, v in sorted(project_totals["monthly"].items()))
+            spent_summary = " | ".join(format_money(v, c) for c, v in sorted(project_totals["spent"].items()))
+            estimate_summary = " | ".join(format_money(v, c) for c, v in sorted(project_totals["estimate"].items()))
+            lines.extend([
+                f"💼 <b>جمع پروژه {escape(project['name'])}</b>",
+                f"   💰 ماهانه: <b>{monthly_summary}</b>",
+                f"   📈 مصرف تا الان: <b>{spent_summary}</b>",
+                f"   📅 برآورد پایان ماه: <b>{estimate_summary}</b>",
+                "",
+            ])
+    if not totals["monthly"]:
+        lines.append("❌ اطلاعات قیمت از API هتزنر دریافت نشد.")
     else:
-        summary = " | ".join(format_money(v, c) for c, v in sorted(totals.items()))
-        lines.append(f"💰 <b>کل همه پروژه‌ها: {summary}</b>")
+        monthly_summary = " | ".join(format_money(v, c) for c, v in sorted(totals["monthly"].items()))
+        spent_summary = " | ".join(format_money(v, c) for c, v in sorted(totals["spent"].items()))
+        estimate_summary = " | ".join(format_money(v, c) for c, v in sorted(totals["estimate"].items()))
+        lines.extend([
+            "━━━━━━━━━━━━━━━━━━━━",
+            "💰 <b>جمع کل همه پروژه‌ها</b>",
+            f"   💳 هزینه ماهانه: <b>{monthly_summary}</b>",
+            f"   📈 مصرف تا الان: <b>{spent_summary}</b>",
+            f"   📅 برآورد پایان ماه: <b>{estimate_summary}</b>",
+        ])
     return "\n".join(lines)
 
 def clip(text: str, limit: int = MAX_TEXT) -> str:
