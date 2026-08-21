@@ -171,32 +171,33 @@ def _money_to_float(value) -> float:
 
 
 def server_monthly_price_eur(server, server_types=None) -> float:
-    """Get monthly price from server type pricing. Some hcloud versions do not attach prices to server objects."""
+    """Resolve monthly price from Hetzner server type prices.
+
+    Server objects returned by hcloud do not always contain expanded price data.
+    Always resolve through /server_types and match the server location first.
+    """
     try:
         st = getattr(server, "server_type", None)
-        candidates = []
-        if st:
-            candidates.append(st)
         if server_types:
             sid = getattr(st, "id", None)
             name = getattr(st, "name", None)
-            candidates.extend([
-                x for x in server_types
-                if (sid and getattr(x, "id", None) == sid) or (name and getattr(x, "name", None) == name)
-            ])
+            st = next((x for x in server_types
+                       if getattr(x, "id", None) == sid or getattr(x, "name", None) == name), st)
+
+        prices = getattr(st, "prices", None) or []
+        if not prices:
+            return 0.0
+
         loc = server_location(server)
-        for item in candidates:
-            prices = getattr(item, "prices", None) or []
-            for price in prices:
-                location = getattr(getattr(price, "location", None), "name", "")
-                if location == loc:
-                    value = _money_to_float(getattr(price, "price_monthly", None))
-                    if value:
-                        return value
-            if prices:
-                value = _money_to_float(getattr(prices[0], "price_monthly", None))
-                if value:
-                    return value
+        # Prefer exact location price
+        for price in prices:
+            price_loc = getattr(getattr(price, "location", None), "name", "")
+            if price_loc == loc:
+                return _money_to_float(getattr(price, "price_monthly", None))
+
+        # Fallback only when Hetzner did not return location metadata
+        if len(prices) == 1:
+            return _money_to_float(getattr(prices[0], "price_monthly", None))
     except Exception:
         pass
     return 0.0
@@ -219,8 +220,8 @@ def cost_tracking_save(data: dict) -> None:
         pass
 
 
-def server_cost_line(server) -> str:
-    price = server_monthly_price_eur(server)
+def server_cost_line(server, server_types=None) -> str:
+    price = server_monthly_price_eur(server, server_types)
     if price:
         return f"💰 ماهانه: <b>€{price:.2f}</b>"
     return ""
@@ -349,7 +350,7 @@ def projects_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
-def server_text(server, project_name: str) -> str:
+def server_text(server, project_name: str, server_types=None) -> str:
     ipv4 = server_ipv4(server) or "ندارد"
     ipv6 = server_ipv6(server) or "ندارد"
     status = getattr(server, "status", "unknown")
@@ -367,8 +368,8 @@ def server_text(server, project_name: str) -> str:
         f"IPv6: <code>{escape(str(ipv6))}</code>\n"
         f"پلن: <code>{escape(str(server_type))}</code> — {cores} vCPU / {memory} GB RAM / {disk} GB\n"
         f"موقعیت: <code>{escape(server_location(server))}</code>\n"
-        f"{server_cost_line(server)}\n"
-        f"💳 مصرف تا الان: <b>€{server_spent_so_far(server, server_monthly_price_eur(server)):.2f}</b>\n"
+        f"{server_cost_line(server, server_types)}\n"
+        f"💳 مصرف تا الان: <b>€{server_spent_so_far(server, server_monthly_price_eur(server, server_types)):.2f}</b>\n"
         f"{traffic_line(server)}"
     )
 
@@ -952,7 +953,8 @@ async def show_server(query, pidx: int, sid: int, notice: str | None = None) -> 
     if not server:
         await query.answer("سرور پیدا نشد.", show_alert=True)
         return
-    text = server_text(server, project["name"])
+    server_types = await asyncio.to_thread(project["client"].server_types.get_all)
+    text = server_text(server, project["name"], server_types)
     if notice:
         text += f"\n\n{notice}"
     await safe_edit(query, text, server_keyboard(pidx, server))
@@ -2086,7 +2088,8 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 context.user_data.pop("server_create", None)
                 context.user_data.pop("panel_chat_id", None)
                 context.user_data.pop("panel_message_id", None)
-                text = "✅ <b>سرور با موفقیت ساخته شد.</b>\n\n" + server_text(server, project["name"])
+                server_types = await asyncio.to_thread(project["client"].server_types.get_all)
+                text = "✅ <b>سرور با موفقیت ساخته شد.</b>\n\n" + server_text(server, project["name"], server_types)
                 if pending.get("auth_mode") == "ssh":
                     text += f"\n\n🔑 ورود با SSH Key: <code>{escape(str(pending.get('ssh_key_name') or 'Selected key'))}</code>"
                 elif root_password:
