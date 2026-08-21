@@ -300,3 +300,17 @@ hetzner_telegram_bot/
 - Tokenها در منوی List به‌صورت Mask شده نمایش داده می‌شوند.
 
 - سیستم‌عامل پیش‌فرض ساخت سرور: **Ubuntu 24.04 LTS** (`ubuntu-24.04`).
+
+
+## 💰 قیمت ماهانه از Hetzner Pricing API
+
+قیمت ماهانه سرورها از endpoint رسمی `GET /v1/pricing` گرفته می‌شود و با `server_type` و `Location` همان سرور تطبیق داده می‌شود. این روش به‌جای اتکا به metadata قدیمی SDK، قیمت پروژه را مستقیماً از Hetzner می‌گیرد. API قیمت‌ها را با currency و هر دو مقدار net/gross برمی‌گرداند؛ تنظیم پیش‌فرض این نسخه `gross` است.
+
+تنظیمات:
+
+```env
+HETZNER_PRICE_KIND=gross
+PRICE_CACHE_TTL_SECONDS=600
+```
+
+نسخه ربات، Installer و فایل `VERSION` در این Release همگی `15.1` هستند.

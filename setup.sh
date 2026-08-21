@@ -18,7 +18,7 @@ CYAN='\033[0;36m'
 BOLD='\033[1m'
 NC='\033[0m'
 
-INSTALLER_VERSION="14.6"
+INSTALLER_VERSION="15.1"
 TTY_FD=0
 if [[ -r /dev/tty && -w /dev/tty ]]; then
   exec 3<>/dev/tty
@@ -242,6 +242,7 @@ install_flow() {
   download_file "bot.py" "$APP_DIR/bot.py" 0644
   download_file "setup.sh" "$APP_DIR/setup.sh" 0755
   download_file "README.md" "$APP_DIR/README.md" 0644 || true
+  download_file "VERSION" "$APP_DIR/VERSION" 0644
   install_python_deps
 
   echo
@@ -264,6 +265,8 @@ HETZNER_PROJECTS_B64=${projects_b64}
 BOT_TIMEZONE=Asia/Tehran
 TRAFFIC_CHECK_TIME=23:30
 CHEAP_CHECK_HOURS=1
+HETZNER_PRICE_KIND=gross
+PRICE_CACHE_TTL_SECONDS=600
 STATE_FILE=${APP_DIR}/.traffic_alert_state.json
 AVAILABILITY_STATE_FILE=${APP_DIR}/.cost_optimized_state.json
 EOF
@@ -290,7 +293,14 @@ update_flow() {
   download_file "bot.py" "$APP_DIR/bot.py" 0644
   download_file "setup.sh" "$APP_DIR/setup.sh" 0755
   download_file "README.md" "$APP_DIR/README.md" 0644 || true
+  download_file "VERSION" "$APP_DIR/VERSION" 0644
   install_python_deps
+  if [[ -z "$(read_env_value HETZNER_PRICE_KIND)" ]]; then
+    set_env_value "HETZNER_PRICE_KIND" "gross"
+  fi
+  if [[ -z "$(read_env_value PRICE_CACHE_TTL_SECONDS)" ]]; then
+    set_env_value "PRICE_CACHE_TTL_SECONDS" "600"
+  fi
   write_service
   $SUDO chown -R "$BOT_USER:$BOT_USER" "$APP_DIR"
   restart_service

@@ -5,6 +5,9 @@ import json
 import logging
 import os
 import re
+import urllib.error
+import urllib.request
+import time as monotonic_time
 from datetime import datetime, time, timezone
 from html import escape
 from pathlib import Path
@@ -38,7 +41,10 @@ TRAFFIC_ALERT_TB = (18.0, 19.0, 20.0)
 CHEAP_CHECK_HOURS = float(os.getenv("CHEAP_CHECK_HOURS", "1") or 1)
 STATE_FILE = Path(os.getenv("STATE_FILE", "/opt/hetzner-telegram-bot/.traffic_alert_state.json"))
 AVAILABILITY_STATE_FILE = Path(os.getenv("AVAILABILITY_STATE_FILE", "/opt/hetzner-telegram-bot/.cost_optimized_state.json"))
-BOT_VERSION = "15.0"
+BOT_VERSION = "15.1"
+RELEASE_VERSION_FILE = Path(os.getenv("RELEASE_VERSION_FILE", "/opt/hetzner-telegram-bot/VERSION"))
+HETZNER_PRICE_KIND = os.getenv("HETZNER_PRICE_KIND", "gross").strip().lower() or "gross"
+PRICE_CACHE_TTL_SECONDS = int(os.getenv("PRICE_CACHE_TTL_SECONDS", "600") or 600)
 COST_TRACK_STATE_FILE = Path(os.getenv("COST_TRACK_STATE_FILE", "/opt/hetzner-telegram-bot/.cost_tracking.json"))
 AUTO_CREATE_STATE_FILE = Path(os.getenv("AUTO_CREATE_STATE_FILE", "/opt/hetzner-telegram-bot/.cost_auto_create.json"))
 AUTO_CREATE_CHECK_MINUTES = int(os.getenv("AUTO_CREATE_CHECK_MINUTES", "60") or 60)
@@ -79,12 +85,12 @@ def load_projects() -> list[dict]:
                 name = str(item.get("name", "")).strip()
                 token = str(item.get("token", "")).strip()
                 if name and token:
-                    projects.append({"name": name, "client": Client(token=token)})
+                    projects.append({"name": name, "token": token, "client": Client(token=token)})
         except Exception as exc:
             raise SystemExit(f"Invalid HETZNER_PROJECTS_B64: {exc}") from exc
 
     if not projects and LEGACY_HETZNER_TOKEN:
-        projects.append({"name": LEGACY_PROJECT_NAME, "client": Client(token=LEGACY_HETZNER_TOKEN)})
+        projects.append({"name": LEGACY_PROJECT_NAME, "token": LEGACY_HETZNER_TOKEN, "client": Client(token=LEGACY_HETZNER_TOKEN)})
     return projects
 
 
@@ -142,7 +148,7 @@ def traffic_line(server) -> str:
 
 
 def _money_to_float(value) -> float:
-    """Convert hcloud Price objects/dicts/numbers safely to float."""
+    """Convert Hetzner price values safely to float."""
     try:
         if value is None:
             return 0.0
@@ -152,68 +158,143 @@ def _money_to_float(value) -> float:
         if amount is not None:
             return float(amount)
         if isinstance(value, dict):
-            return float(value.get("amount") or value.get("value") or 0)
+            for key in ("gross", "net", "amount", "value"):
+                if value.get(key) is not None:
+                    return float(value[key])
         return float(str(value))
     except Exception:
         return 0.0
 
 
-def _price_monthly_from_entry(price):
-    """Handle hcloud versions where price_monthly shape changed."""
+def _configured_price_kind() -> str:
+    return "net" if HETZNER_PRICE_KIND == "net" else "gross"
+
+
+def _read_json(url: str, token: str) -> dict:
+    request = urllib.request.Request(
+        url,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/json",
+            "User-Agent": f"hetzner-telegram-bot/{BOT_VERSION}",
+        },
+        method="GET",
+    )
+    with urllib.request.urlopen(request, timeout=20) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+_PRICE_CACHE: dict[str, tuple[float, dict]] = {}
+
+
+def _fetch_project_pricing(project: dict) -> dict | None:
+    """Fetch authoritative project pricing from Hetzner /v1/pricing with a short cache."""
+    token = str(project.get("token", "")).strip()
+    if not token:
+        return None
+    project_name = str(project.get("name", ""))
+    now = monotonic_time.monotonic()
+    cached = _PRICE_CACHE.get(project_name)
+    if cached and now - cached[0] < PRICE_CACHE_TTL_SECONDS:
+        return cached[1]
     try:
-        monthly = getattr(price, "price_monthly", None)
-        if monthly is None and isinstance(price, dict):
-            monthly = price.get("price_monthly")
-        return _money_to_float(monthly)
+        payload = _read_json("https://api.hetzner.cloud/v1/pricing", token)
+        pricing = payload.get("pricing")
+        if not isinstance(pricing, dict):
+            raise ValueError("pricing object missing")
+        _PRICE_CACHE[project_name] = (now, pricing)
+        return pricing
+    except (urllib.error.URLError, TimeoutError, ValueError, json.JSONDecodeError) as exc:
+        log.warning("Could not fetch Hetzner pricing for project %s: %s", project_name, exc)
     except Exception:
-        return 0.0
+        log.exception("Unexpected pricing API failure for project %s", project_name)
+    return None
 
 
-def server_monthly_price_eur(server, server_types=None) -> float:
-    """Resolve monthly price with multiple fallbacks.
+def _pricing_server_monthly(pricing: dict, server) -> tuple[float, str] | None:
+    """Resolve monthly price by exact server type and Location."""
+    server_type = getattr(server, "server_type", None)
+    server_type_id = getattr(server_type, "id", None)
+    server_type_name = str(getattr(server_type, "name", "") or "")
+    location_name = server_location(server)
+    entry = next((
+        item for item in (pricing.get("server_types") or [])
+        if (server_type_id is not None and item.get("id") == server_type_id)
+        or (server_type_name and item.get("name") == server_type_name)
+    ), None)
+    if not isinstance(entry, dict):
+        return None
+    prices = entry.get("prices") or []
+    normalized = str(location_name).lower().replace("_", "-").strip()
+    candidate = next((
+        price for price in prices
+        if str(price.get("location", "")).lower().replace("_", "-").strip() == normalized
+    ), None)
+    if not isinstance(candidate, dict):
+        return None
+    monthly = candidate.get("price_monthly") or {}
+    amount = _money_to_float(monthly.get(_configured_price_kind()))
+    if amount <= 0:
+        return None
+    return amount, str(pricing.get("currency") or "EUR").upper()
 
-    v14 returned zero when hcloud price metadata shape or location matching
-    differed. This version checks id/name, location objects, dictionaries,
-    and finally logs the reason instead of silently failing.
-    """
+
+def _fallback_server_monthly_price(server, server_types=None) -> tuple[float, str] | None:
+    """SDK metadata fallback for temporary pricing API failures."""
     try:
         st = getattr(server, "server_type", None)
         if server_types:
             sid = getattr(st, "id", None)
             name = getattr(st, "name", None)
-            st = next((x for x in server_types
-                       if getattr(x, "id", None) == sid or getattr(x, "name", None) == name), st)
-
+            st = next((x for x in server_types if getattr(x, "id", None) == sid or getattr(x, "name", None) == name), st)
         prices = getattr(st, "prices", None) or []
-        if not prices:
-            log.warning("No prices found for server %s type=%s", getattr(server, 'name', '?'), getattr(st, 'name', '?'))
-            return 0.0
-
         loc = server_location(server)
         normalized = str(loc).lower().replace("_", "-").strip()
-
+        candidates = []
         for price in prices:
             p_loc = getattr(getattr(price, "location", None), "name", None)
-            if p_loc is None and isinstance(price, dict):
-                p_loc = (price.get("location") or {}).get("name") if isinstance(price.get("location"), dict) else None
             if p_loc and str(p_loc).lower().replace("_", "-").strip() == normalized:
-                value = _price_monthly_from_entry(price)
-                if value:
-                    return value
-
-        # If only one regional price exists use it.
-        if len(prices) == 1:
-            return _price_monthly_from_entry(prices[0])
-
-        # Last safe fallback: first valid price.
-        for price in prices:
-            value = _price_monthly_from_entry(price)
-            if value:
-                return value
-
+                candidates.append(price)
+        if not candidates and len(prices) == 1:
+            candidates = prices[:1]
+        if candidates:
+            monthly = getattr(candidates[0], "price_monthly", None)
+            amount = _money_to_float(monthly)
+            if amount:
+                return amount, str(getattr(monthly, "currency", None) or "EUR").upper()
     except Exception:
-        log.exception("Price resolution failed for server %s", getattr(server, 'name', '?'))
-    return 0.0
+        log.exception("SDK price fallback failed for server %s", getattr(server, "name", "?"))
+    return None
+
+
+def server_monthly_price_info(project: dict, server, server_types=None) -> tuple[float, str] | None:
+    pricing = _fetch_project_pricing(project)
+    if pricing:
+        result = _pricing_server_monthly(pricing, server)
+        if result:
+            return result
+    return _fallback_server_monthly_price(server, server_types)
+
+
+def server_monthly_price_eur(server, server_types=None, project: dict | None = None) -> float:
+    """Compatibility helper returning only the numeric monthly price."""
+    info = server_monthly_price_info(project, server, server_types) if project else _fallback_server_monthly_price(server, server_types)
+    return float(info[0]) if info else 0.0
+
+
+def format_money(amount: float, currency: str) -> str:
+    symbols = {"EUR": "€", "USD": "$", "GBP": "£"}
+    currency = (currency or "EUR").upper()
+    return f"{symbols.get(currency, currency + ' ')}{amount:.2f}"
+
+
+def server_cost_line(project: dict, server, server_types=None) -> str:
+    info = server_monthly_price_info(project, server, server_types)
+    if not info:
+        return "💰 ماهانه: <b>نامشخص</b>"
+    amount, currency = info
+    kind_fa = "با مالیات" if _configured_price_kind() == "gross" else "بدون مالیات"
+    return f"💰 ماهانه: <b>{format_money(amount, currency)}</b> ({kind_fa})"
 
 def cost_tracking_load() -> dict:
     try:
@@ -232,12 +313,6 @@ def cost_tracking_save(data: dict) -> None:
         pass
 
 
-def server_cost_line(server, server_types=None) -> str:
-    price = server_monthly_price_eur(server, server_types)
-    if price:
-        return f"💰 ماهانه: <b>€{price:.2f}</b>"
-    return ""
-
 
 def server_spent_so_far(server, price: float) -> float:
     data = cost_tracking_load()
@@ -254,33 +329,46 @@ def server_spent_so_far(server, price: float) -> float:
 
 
 async def cost_report_text() -> str:
-    lines = ["📊 <b>گزارش هزینه ماهانه</b>", ""]
-    total = 0.0
+    lines = [
+        "📊 <b>گزارش هزینه ماهانه</b>",
+        "",
+        f"نوع قیمت: <b>{'با مالیات (Gross)' if _configured_price_kind() == 'gross' else 'بدون مالیات (Net)'}</b>",
+        "مرجع قیمت: <b>Hetzner Pricing API</b>",
+        "",
+    ]
+    totals: dict[str, float] = {}
     for project in PROJECTS:
         try:
             servers = await asyncio.to_thread(project["client"].servers.get_all)
         except Exception:
             continue
-        project_total = 0.0
         project_lines = []
+        project_totals: dict[str, float] = {}
         try:
             server_types = await asyncio.to_thread(project["client"].server_types.get_all)
         except Exception:
             server_types = []
         for server in servers:
-            price = server_monthly_price_eur(server, server_types)
-            if price:
-                project_total += price
-                total += price
-                project_lines.append(f"🖥 {escape(server.name)}   €{price:.2f} | مصرف: €{server_spent_so_far(server, price):.2f}")
+            info = server_monthly_price_info(project, server, server_types)
+            if not info:
+                continue
+            price, currency = info
+            project_totals[currency] = project_totals.get(currency, 0.0) + price
+            totals[currency] = totals.get(currency, 0.0) + price
+            spent = server_spent_so_far(server, price)
+            project_lines.append(
+                f"🖥 {escape(server.name)}   {format_money(price, currency)} | برآورد مصرف: {format_money(spent, currency)}"
+            )
         if project_lines:
             lines.append(f"📁 <b>{escape(project['name'])}</b>")
             lines.extend(project_lines)
-            lines.append(f"\nجمع پروژه: <b>€{project_total:.2f}</b>\n")
-    if not total:
+            summary = " | ".join(format_money(v, c) for c, v in sorted(project_totals.items()))
+            lines.append(f"\nجمع پروژه: <b>{summary}</b>\n")
+    if not totals:
         lines.append("اطلاعات قیمت از API هتزنر دریافت نشد.")
     else:
-        lines.append(f"💰 <b>کل همه پروژه‌ها: €{total:.2f}</b>")
+        summary = " | ".join(format_money(v, c) for c, v in sorted(totals.items()))
+        lines.append(f"💰 <b>کل همه پروژه‌ها: {summary}</b>")
     return "\n".join(lines)
 
 def clip(text: str, limit: int = MAX_TEXT) -> str:
@@ -362,7 +450,7 @@ def projects_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
-def server_text(server, project_name: str, server_types=None) -> str:
+def server_text(server, project_name: str, server_types=None, project_info: dict | None = None) -> str:
     ipv4 = server_ipv4(server) or "ندارد"
     ipv6 = server_ipv6(server) or "ندارد"
     status = getattr(server, "status", "unknown")
@@ -372,6 +460,9 @@ def server_text(server, project_name: str, server_types=None) -> str:
     cores = getattr(st, "cores", "?")
     memory = getattr(st, "memory", "?")
     disk = getattr(st, "disk", "?")
+    project_info = project_info or {"name": project_name}
+    info = server_monthly_price_info(project_info, server, server_types)
+    estimate = "نامشخص" if not info else format_money(server_spent_so_far(server, info[0]), info[1])
     return (
         f"🖥 <b>{escape(server.name)}</b>\n"
         f"📁 پروژه: <b>{escape(project_name)}</b>\n\n"
@@ -380,8 +471,8 @@ def server_text(server, project_name: str, server_types=None) -> str:
         f"IPv6: <code>{escape(str(ipv6))}</code>\n"
         f"پلن: <code>{escape(str(server_type))}</code> — {cores} vCPU / {memory} GB RAM / {disk} GB\n"
         f"موقعیت: <code>{escape(server_location(server))}</code>\n"
-        f"{server_cost_line(server, server_types)}\n"
-        f"💳 مصرف تا الان: <b>€{server_spent_so_far(server, server_monthly_price_eur(server, server_types)):.2f}</b>\n"
+        f"{server_cost_line(project_info, server, server_types)}\n"
+        f"💳 برآورد مصرف تا الان: <b>{estimate}</b>\n"
         f"{traffic_line(server)}"
     )
 
@@ -966,7 +1057,7 @@ async def show_server(query, pidx: int, sid: int, notice: str | None = None) -> 
         await query.answer("سرور پیدا نشد.", show_alert=True)
         return
     server_types = await asyncio.to_thread(project["client"].server_types.get_all)
-    text = server_text(server, project["name"], server_types)
+    text = server_text(server, project["name"], server_types, project)
     if notice:
         text += f"\n\n{notice}"
     await safe_edit(query, text, server_keyboard(pidx, server))
@@ -2101,7 +2192,7 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 context.user_data.pop("panel_chat_id", None)
                 context.user_data.pop("panel_message_id", None)
                 server_types = await asyncio.to_thread(project["client"].server_types.get_all)
-                text = "✅ <b>سرور با موفقیت ساخته شد.</b>\n\n" + server_text(server, project["name"], server_types)
+                text = "✅ <b>سرور با موفقیت ساخته شد.</b>\n\n" + server_text(server, project["name"], server_types, project)
                 if pending.get("auth_mode") == "ssh":
                     text += f"\n\n🔑 ورود با SSH Key: <code>{escape(str(pending.get('ssh_key_name') or 'Selected key'))}</code>"
                 elif root_password:
@@ -2822,6 +2913,13 @@ def parse_job_time() -> time:
         raise SystemExit(f"Invalid TRAFFIC_CHECK_TIME/BOT_TIMEZONE: {exc}") from exc
 
 
+def installed_release_version() -> str:
+    try:
+        return RELEASE_VERSION_FILE.read_text(encoding="utf-8").strip()
+    except Exception:
+        return BOT_VERSION
+
+
 def validate_config() -> None:
     missing = []
     if not TELEGRAM_TOKEN:
@@ -2834,6 +2932,9 @@ def validate_config() -> None:
         missing.append("CHEAP_CHECK_HOURS (> 0)")
     if missing:
         raise SystemExit("Missing/invalid configuration: " + ", ".join(missing))
+    installed = installed_release_version()
+    if installed != BOT_VERSION:
+        log.warning("Release file version %s does not match bot version %s", installed, BOT_VERSION)
 
 
 if __name__ == "__main__":
