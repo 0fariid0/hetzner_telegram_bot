@@ -41,7 +41,7 @@ TRAFFIC_ALERT_TB = (18.0, 19.0, 20.0)
 CHEAP_CHECK_HOURS = float(os.getenv("CHEAP_CHECK_HOURS", "1") or 1)
 STATE_FILE = Path(os.getenv("STATE_FILE", "/opt/hetzner-telegram-bot/.traffic_alert_state.json"))
 AVAILABILITY_STATE_FILE = Path(os.getenv("AVAILABILITY_STATE_FILE", "/opt/hetzner-telegram-bot/.cost_optimized_state.json"))
-BOT_VERSION = "16.1"
+BOT_VERSION = "16.2"
 RELEASE_VERSION_FILE = Path(os.getenv("RELEASE_VERSION_FILE", "/opt/hetzner-telegram-bot/VERSION"))
 HETZNER_PRICE_KIND = os.getenv("HETZNER_PRICE_KIND", "gross").strip().lower() or "gross"
 PRICE_CACHE_TTL_SECONDS = int(os.getenv("PRICE_CACHE_TTL_SECONDS", "600") or 600)
@@ -84,12 +84,12 @@ def load_projects() -> list[dict]:
                 name = str(item.get("name", "")).strip()
                 token = str(item.get("token", "")).strip()
                 if name and token:
-                    projects.append({"name": name, "token": token, "client": Client(token=token)})
+                    projects.append({"name": name, "token": token, "client": Client(token=token, timeout=30)})
         except Exception as exc:
             raise SystemExit(f"Invalid HETZNER_PROJECTS_B64: {exc}") from exc
 
     if not projects and LEGACY_HETZNER_TOKEN:
-        projects.append({"name": LEGACY_PROJECT_NAME, "token": LEGACY_HETZNER_TOKEN, "client": Client(token=LEGACY_HETZNER_TOKEN)})
+        projects.append({"name": LEGACY_PROJECT_NAME, "token": LEGACY_HETZNER_TOKEN, "client": Client(token=LEGACY_HETZNER_TOKEN, timeout=30)})
     return projects
 
 
@@ -1776,215 +1776,275 @@ def swap_progress_text(server_name: str, old_ip: str | None, new_ip: str | None,
     )
 
 
+# Each journal is written before shutdown; tokens are never written to disk.
+IP_SWAP_DIR = Path(os.getenv("IP_SWAP_STATE_DIR", str(Path(__file__).resolve().parent / ".ip-swap-state")))
+_IP_SWAPS_ACTIVE: set[int] = set()
+
+
+def bot_host_server_id() -> int:
+    """Fail closed if host identity cannot be determined (0 = explicit external host)."""
+    configured = os.getenv("BOT_HOST_SERVER_ID", "").strip()
+    if configured:
+        value = int(configured)
+        if value < 0:
+            raise ValueError("BOT_HOST_SERVER_ID باید صفر یا شناسه سرور میزبان باشد")
+        return value
+    try:
+        # Link-local metadata must never go through an HTTP proxy.
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        with opener.open("http://169.254.169.254/hetzner/v1/metadata/instance-id", timeout=3) as response:
+            value = response.read(64).decode().strip()
+        if value.isdigit() and int(value) > 0:
+            return int(value)
+    except Exception:
+        log.warning("Could not identify bot host using Hetzner metadata")
+    raise RuntimeError(
+        "شناسه سرور میزبان ربات مشخص نشد؛ BOT_HOST_SERVER_ID را در .env تنظیم کنید. "
+        "فقط اگر ربات خارج از Hetzner Cloud اجرا می‌شود، مقدار 0 بگذارید."
+    )
+
+
+def swap_journal_path(project, server_id):
+    import hashlib
+    key = hashlib.sha256(project["token"].encode()).hexdigest()[:24]
+    return IP_SWAP_DIR / f"{key}-{server_id}.json"
+
+
+def write_swap_journal(path, state):
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    temporary = path.with_suffix(".tmp")
+    with temporary.open("w", encoding="utf-8") as stream:
+        json.dump(state, stream)
+        stream.flush()
+        os.fsync(stream.fileno())
+    temporary.replace(path)
+    directory = os.open(str(path.parent), os.O_RDONLY)
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
+
+
+async def swap_notice(query, text, markup=None):
+    # Telegram is only a progress display; its failure must not stop the server workflow.
+    try:
+        await safe_edit(query, text, markup)
+    except Exception:
+        log.exception("Could not display Primary IPv4 swap status")
+
+
+async def finish_swap_action(action, timeout=300):
+    deadline = asyncio.get_running_loop().time() + timeout
+    while True:
+        await asyncio.to_thread(action.reload)
+        if action.status == "success":
+            return
+        if action.status == "error":
+            raise RuntimeError(f"Hetzner action {action.id}: {action.error}")
+        if asyncio.get_running_loop().time() >= deadline:
+            raise TimeoutError(f"Hetzner action {action.id} is still running")
+        await asyncio.sleep(2)
+
+
+async def settle_swap_resource(resource):
+    for action in await asyncio.to_thread(resource.get_actions, status=["running"]):
+        await finish_swap_action(action)
+
+
+async def require_swap_status(client, server_id, wanted, timeout=300):
+    server = await wait_server_status(client, server_id, wanted, timeout)
+    if not server or server.status != wanted:
+        raise TimeoutError(f"سرور به وضعیت {wanted} نرسید")
+    return server
+
+
+async def power_on_after_swap(client, server_id):
+    last_error = None
+    for attempt in range(3):
+        try:
+            server = await asyncio.to_thread(client.servers.get_by_id, server_id)
+            await settle_swap_resource(server)
+            server = await asyncio.to_thread(client.servers.get_by_id, server_id)
+            if server.status == "running":
+                return server
+            if server.status == "off":
+                await finish_swap_action(await asyncio.to_thread(server.power_on))
+            return await require_swap_status(client, server_id, "running", 180)
+        except Exception as exc:
+            last_error = exc
+            if attempt < 2:
+                await asyncio.sleep(3)
+    raise RuntimeError(f"روشن کردن سرور تأیید نشد: {last_error}")
+
+
+async def recover_ipv4_swap(client, state):
+    """Reconcile live assignments, including requests whose HTTP response was lost."""
+    sid = state["server_id"]
+    server = await asyncio.to_thread(client.servers.get_by_id, sid)
+    if not server:
+        raise RuntimeError("سرور برای بازیابی پیدا نشد")
+    await settle_swap_resource(server)
+    for ipid in (state.get("old_ip_id"), state.get("new_ip_id")):
+        if ipid:
+            resource = await asyncio.to_thread(client.primary_ips.get_by_id, ipid)
+            if not resource:
+                raise RuntimeError(f"Primary IP #{ipid} برای بازیابی پیدا نشد")
+            await settle_swap_resource(resource)
+    server = await asyncio.to_thread(client.servers.get_by_id, sid)
+    if server.status == "stopping":
+        server = await require_swap_status(client, sid, "off")
+    if server.status == "starting":
+        server = await require_swap_status(client, sid, "running")
+    if server.status == "running" and state.get("shutdown_pending"):
+        # An accepted ACPI request may take effect after our original timeout.
+        # Do not clear its recovery record just because the VM is still running.
+        server = await require_swap_status(client, sid, "off")
+    ips = await asyncio.to_thread(client.primary_ips.get_all)
+    current = primary_ipv4_for_server(ips, sid)
+    allowed = {state.get("old_ip_id"), state.get("new_ip_id")}
+    if current and current.id not in allowed:
+        raise RuntimeError("IP سرور خارج از عملیات ربات تغییر کرده؛ بازیابی خودکار متوقف شد")
+    if server.status == "running":
+        if state.get("old_ip_id") and current is None:
+            raise RuntimeError("سرور روشن است ولی IPv4 ندارد؛ بررسی دستی لازم است")
+        return f"سرور روشن است؛ IPv4 فعلی: {current.ip if current else 'ندارد'}"
+    if server.status != "off":
+        raise RuntimeError(f"بازیابی در وضعیت {server.status} امکان‌پذیر نیست")
+    # While off, prefer restoring the original IP. Never force power off for rollback.
+    old_id = state.get("old_ip_id")
+    if old_id:
+        old = await asyncio.to_thread(client.primary_ips.get_by_id, old_id)
+        if old.assignee_id not in (None, sid):
+            raise RuntimeError("IP قبلی به سرور دیگری وصل شده؛ بازیابی خودکار متوقف شد")
+        if current and current.id != old_id:
+            await finish_swap_action(await asyncio.to_thread(current.unassign))
+        old = await asyncio.to_thread(client.primary_ips.get_by_id, old_id)
+        if old.assignee_id is None:
+            await finish_swap_action(await asyncio.to_thread(old.assign, assignee_id=sid, assignee_type="server"))
+        verified = await asyncio.to_thread(client.primary_ips.get_by_id, old_id)
+        if verified.assignee_id != sid:
+            raise RuntimeError("بازگشت IP قبلی تأیید نشد")
+    if state["was_running"]:
+        await power_on_after_swap(client, sid)
+        return "IP سرور بررسی/بازیابی شد و روشن‌شدن آن تأیید شد"
+    return "IP سرور بررسی/بازیابی شد؛ سرور مانند قبل از عملیات خاموش است"
+
+
+async def recover_pending_ipv4_swaps(application):
+    # Recovery runs before accepting new Telegram commands after a bot restart.
+    for project in PROJECTS:
+        prefix = swap_journal_path(project, 0).name.rsplit("-", 1)[0]
+        for path in IP_SWAP_DIR.glob(f"{prefix}-*.json"):
+            try:
+                state = json.loads(path.read_text(encoding="utf-8"))
+                if await asyncio.to_thread(bot_host_server_id) == state["server_id"]:
+                    raise RuntimeError("بازیابی خودکار روی میزبان خود ربات مجاز نیست")
+                note = await recover_ipv4_swap(project["client"], state)
+                path.unlink()
+                text = f"بازیابی عملیات نیمه‌تمام سرور #{state['server_id']}: {note}"
+            except Exception as exc:
+                log.exception("Pending Primary IPv4 recovery failed: %s", path.name)
+                text = f"بازیابی تعویض IP کامل نشد؛ وضعیت سرور را در Hetzner بررسی کنید: {exc}"
+            try:
+                await application.bot.send_message(chat_id=int(ALLOWED_USER_ID), text=text)
+            except Exception:
+                log.exception("Could not report pending swap recovery")
+
+
 async def perform_primary_ipv4_swap(query, pidx: int, server_id: int, target_ip_id: int | None) -> None:
     project = get_project(pidx)
     if not project:
         await query.answer("پروژه پیدا نشد.", show_alert=True)
         return
+    if server_id in _IP_SWAPS_ACTIVE:
+        await query.answer("عملیات تعویض IP این سرور در حال اجراست.", show_alert=True)
+        return
+    _IP_SWAPS_ACTIVE.add(server_id)
     client = project["client"]
-    server, primary_ips = await asyncio.gather(
-        asyncio.to_thread(client.servers.get_by_id, server_id),
-        asyncio.to_thread(client.primary_ips.get_all),
-    )
-    if not server:
-        await query.answer("سرور پیدا نشد.", show_alert=True)
-        return
-
-    old_ip = primary_ipv4_for_server(primary_ips, server_id)
-    old_value = str(old_ip.ip) if old_ip else None
-    location_name = server_location(server)
-    new_ip = None
-    created_new = False
-
-    if target_ip_id is not None:
-        new_ip = await asyncio.to_thread(client.primary_ips.get_by_id, target_ip_id)
-        if not new_ip or getattr(new_ip, "type", None) != "ipv4":
-            await query.answer("IPv4 مقصد پیدا نشد.", show_alert=True)
-            return
-        if getattr(new_ip, "assignee_id", None) is not None:
-            await query.answer("این IPv4 دیگر آزاد نیست.", show_alert=True)
-            return
-        if primary_ip_location(new_ip) != location_name:
-            await query.answer("Location این IPv4 با سرور یکسان نیست.", show_alert=True)
-            return
-        if old_ip and new_ip.id == old_ip.id:
-            await query.answer("این همان IPv4 فعلی سرور است.", show_alert=True)
-            return
-
-    await query.answer("تعویض خودکار شروع شد.")
-    steps = [
-        "⏳ 1/4 خاموش کردن سرور...",
-        "▫️ 2/4 جدا کردن IP قبلی",
-        "▫️ 3/4 اتصال IP جدید",
-        "▫️ 4/4 روشن کردن سرور",
-    ]
-    await safe_edit(query, swap_progress_text(server.name, old_value, str(new_ip.ip) if new_ip else None, steps))
-
-    # Step 1: graceful shutdown and wait until Hetzner reports the server as off.
+    path = swap_journal_path(project, server_id)
+    state = None
+    server = new_ip = old_ip = None
+    markup = InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ برگشت به سرور", callback_data=f"srv:open:{pidx}:{server_id}")]])
     try:
-        fresh_server = await asyncio.to_thread(client.servers.get_by_id, server_id)
-        if getattr(fresh_server, "status", None) != "off":
-            if getattr(fresh_server, "status", None) != "stopping":
-                await asyncio.to_thread(fresh_server.shutdown)
-            fresh_server = await wait_server_status(client, server_id, "off", timeout=300)
-        if not fresh_server or getattr(fresh_server, "status", None) != "off":
-            steps[0] = "❌ 1/4 سرور در 5 دقیقه خاموش نشد"
-            await safe_edit(
-                query,
-                swap_progress_text(server.name, old_value, str(new_ip.ip) if new_ip else None, steps)
-                + "\n\nتعویض متوقف شد و هیچ IPای تغییر نکرد.",
-                InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ برگشت به سرور", callback_data=f"srv:open:{pidx}:{server_id}")]]),
-            )
-            return
-    except Exception as exc:
-        log.exception("Primary IPv4 swap shutdown failed")
-        steps[0] = "❌ 1/4 خطا در خاموش کردن سرور"
-        await safe_edit(
-            query,
-            swap_progress_text(server.name, old_value, str(new_ip.ip) if new_ip else None, steps)
-            + f"\n\n<code>{escape(str(exc))}</code>",
-            InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ برگشت به سرور", callback_data=f"srv:open:{pidx}:{server_id}")]]),
+        # A failed acknowledgement precedes all cloud mutations.
+        await query.answer("در حال بررسی شرایط تعویض IP...")
+        if await asyncio.to_thread(bot_host_server_id) == server_id:
+            raise RuntimeError("این سرور میزبان خود ربات است؛ با خاموش شدن آن ربات هم متوقف می‌شود. برای تعویض IP، ربات را روی سرور دیگری اجرا کنید.")
+        if path.exists():
+            raise RuntimeError("عملیات نیمه‌تمام این سرور ثبت شده است؛ ربات را برای بازیابی مجدداً راه‌اندازی کنید و نتیجه را بررسی کنید.")
+        server, ips = await asyncio.gather(
+            asyncio.to_thread(client.servers.get_by_id, server_id),
+            asyncio.to_thread(client.primary_ips.get_all),
         )
-        return
-
-    steps[0] = "✅ 1/4 سرور کاملاً خاموش شد"
-    await safe_edit(query, swap_progress_text(server.name, old_value, str(new_ip.ip) if new_ip else None, steps))
-
-    # If requested, create a new unassigned IPv4 in the server's Location after shutdown.
-    if new_ip is None:
-        try:
-            generated_name = f"swap-{server.id}-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+        if not server or server.status not in ("running", "off"):
+            raise RuntimeError("سرور باید در وضعیت پایدار Running یا Off باشد")
+        old_ip = primary_ipv4_for_server(ips, server_id)
+        if target_ip_id is None:
+            # Allocation/limit errors happen before any shutdown.
             response = await asyncio.to_thread(
-                client.primary_ips.create,
-                "ipv4",
-                generated_name,
-                location=server.location,
-                auto_delete=False,
+                client.primary_ips.create, "ipv4",
+                f"swap-{server_id}-{datetime.now().strftime('%Y%m%d-%H%M%S')}",
+                location=server.location, auto_delete=False,
             )
-            new_ip = response.primary_ip
-            created_new = True
-            steps[2] = f"⏳ 3/4 IPv4 جدید ساخته شد: {new_ip.ip} — در حال اتصال..."
-            await safe_edit(query, swap_progress_text(server.name, old_value, str(new_ip.ip), steps))
-        except Exception as exc:
-            log.exception("Primary IPv4 create for swap failed")
-            # Nothing has been unassigned yet, so simply power the server back on.
-            try:
-                fresh_server = await asyncio.to_thread(client.servers.get_by_id, server_id)
-                action = await asyncio.to_thread(fresh_server.power_on)
-                await asyncio.to_thread(action.wait_until_finished)
-            except Exception:
-                log.exception("Could not power server back on after primary IP create failure")
-            await safe_edit(
-                query,
-                swap_progress_text(server.name, old_value, None, steps)
-                + f"\n\n❌ ساخت IPv4 جدید ناموفق بود. IP قبلی دست‌نخورده باقی ماند.\n<code>{escape(str(exc))}</code>",
-                InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ برگشت به سرور", callback_data=f"srv:open:{pidx}:{server_id}")]]),
-            )
-            return
-
-    old_unassigned = False
-    try:
-        # Re-fetch resources right before changing assignment.
-        if old_ip:
-            old_ip = await asyncio.to_thread(client.primary_ips.get_by_id, old_ip.id)
-            action = await asyncio.to_thread(old_ip.unassign)
-            await asyncio.to_thread(action.wait_until_finished)
-            old_unassigned = True
-            steps[1] = f"✅ 2/4 IP قبلی جدا شد: {old_value}"
-        else:
-            steps[1] = "✅ 2/4 IP قبلی وجود نداشت"
-        await safe_edit(query, swap_progress_text(server.name, old_value, str(new_ip.ip), steps))
-
+            if getattr(response, "action", None):
+                await finish_swap_action(response.action)
+            target_ip_id = response.primary_ip.id
+        new_ip = await asyncio.to_thread(client.primary_ips.get_by_id, target_ip_id)
+        if not new_ip or new_ip.type != "ipv4" or new_ip.assignee_id is not None:
+            raise RuntimeError("IPv4 مقصد وجود ندارد یا دیگر آزاد نیست")
+        if primary_ip_location(new_ip) != server_location(server):
+            raise RuntimeError("Location آدرس مقصد با سرور یکسان نیست")
+        pending_state = {"server_id": server_id, "old_ip_id": old_ip.id if old_ip else None,
+                         "new_ip_id": new_ip.id, "was_running": server.status == "running"}
+        write_swap_journal(path, pending_state)
+        state = pending_state
+        await swap_notice(query, "⏳ IPv4 مقصد آماده است؛ در حال خاموش کردن امن سرور...")
+        if server.status == "running":
+            state["shutdown_pending"] = True
+            write_swap_journal(path, state)
+            await finish_swap_action(await asyncio.to_thread(server.shutdown))
+        await require_swap_status(client, server_id, "off")
+        state["shutdown_pending"] = False
+        write_swap_journal(path, state)
+        # Revalidate BOTH assignments before detaching the old address.
         new_ip = await asyncio.to_thread(client.primary_ips.get_by_id, new_ip.id)
-        if getattr(new_ip, "assignee_id", None) is not None:
-            raise RuntimeError("IPv4 جدید دیگر آزاد نیست")
-        action = await asyncio.to_thread(new_ip.assign, assignee_id=server_id, assignee_type="server")
-        await asyncio.to_thread(action.wait_until_finished)
-        steps[2] = f"✅ 3/4 IP جدید متصل شد: {new_ip.ip}"
-        await safe_edit(query, swap_progress_text(server.name, old_value, str(new_ip.ip), steps))
+        current = primary_ipv4_for_server(await asyncio.to_thread(client.primary_ips.get_all), server_id)
+        if (current.id if current else None) != state["old_ip_id"] or new_ip.assignee_id is not None:
+            raise RuntimeError("اتصال IPها همزمان تغییر کرده؛ تعویض متوقف شد")
+        if current:
+            await finish_swap_action(await asyncio.to_thread(current.unassign))
+            verified = await asyncio.to_thread(client.primary_ips.get_by_id, current.id)
+            if verified.assignee_id is not None:
+                raise RuntimeError("جدا شدن IP قبلی تأیید نشد")
+        await finish_swap_action(await asyncio.to_thread(new_ip.assign, assignee_id=server_id, assignee_type="server"))
+        verified = await asyncio.to_thread(client.primary_ips.get_by_id, new_ip.id)
+        if verified.assignee_id != server_id:
+            raise RuntimeError("اتصال IP جدید تأیید نشد")
+        await swap_notice(query, "⏳ IP جدید متصل شد؛ در حال روشن کردن سرور...")
+        await power_on_after_swap(client, server_id)
+        path.unlink()
+        state = None
+        text = (f"✅ تعویض IPv4 انجام شد و وضعیت Running تأیید شد.\n"
+                f"سرور: <b>{escape(server.name)}</b>\nIP جدید: <code>{escape(str(new_ip.ip))}</code>\n"
+                "Running به معنی روشن بودن ماشین است؛ وضعیت بوت Ubuntu و دسترسی SSH از این بررسی مشخص نمی‌شود.")
+        if old_ip:
+            text += f"\nIP قبلی حذف نشده: <code>{escape(str(old_ip.ip))}</code>"
+        await swap_notice(query, text, markup)
     except Exception as exc:
-        log.exception("Primary IPv4 swap assignment failed")
-        rollback_ok = not old_unassigned
-        rollback_note = ""
-        if old_ip and old_unassigned:
+        log.exception("Primary IPv4 swap failed for server %s", server_id)
+        note = "هیچ دستور خاموش‌کردنی در این عملیات ارسال نشد."
+        if state is not None:
             try:
-                old_ip = await asyncio.to_thread(client.primary_ips.get_by_id, old_ip.id)
-                action = await asyncio.to_thread(old_ip.assign, assignee_id=server_id, assignee_type="server")
-                await asyncio.to_thread(action.wait_until_finished)
-                rollback_ok = True
-                rollback_note = "\n✅ IP قبلی دوباره به سرور متصل شد."
-            except Exception as rollback_exc:
-                rollback_note = f"\n🛑 بازگردانی IP قبلی هم ناموفق بود: <code>{escape(str(rollback_exc))}</code>"
-                log.exception("Primary IPv4 rollback failed")
-        if created_new and new_ip:
-            try:
-                candidate = await asyncio.to_thread(client.primary_ips.get_by_id, new_ip.id)
-                if candidate and getattr(candidate, "assignee_id", None) is None:
-                    await asyncio.to_thread(candidate.delete)
-            except Exception:
-                log.exception("Could not clean up newly created Primary IPv4")
-        try:
-            fresh_server = await asyncio.to_thread(client.servers.get_by_id, server_id)
-            action = await asyncio.to_thread(fresh_server.power_on)
-            await asyncio.to_thread(action.wait_until_finished)
-        except Exception:
-            log.exception("Could not power server on after swap rollback")
-        await safe_edit(
-            query,
-            swap_progress_text(server.name, old_value, str(new_ip.ip) if new_ip else None, steps)
-            + f"\n\n❌ تعویض IP ناموفق بود.\n<code>{escape(str(exc))}</code>"
-            + rollback_note
-            + ("" if rollback_ok else "\n🛑 وضعیت IP را فوراً در پنل Hetzner بررسی کنید."),
-            InlineKeyboardMarkup(
-                [
-                    [InlineKeyboardButton("📦 Primary IPv4ها", callback_data=f"pips:{pidx}")],
-                    [InlineKeyboardButton("⬅️ برگشت به سرور", callback_data=f"srv:open:{pidx}:{server_id}")],
-                ]
-            ),
-        )
-        return
-
-    # Step 4: power the server on. The IP replacement is already complete at this point.
-    try:
-        fresh_server = await asyncio.to_thread(client.servers.get_by_id, server_id)
-        action = await asyncio.to_thread(fresh_server.power_on)
-        await asyncio.to_thread(action.wait_until_finished)
-        running = await wait_server_status(client, server_id, "running", timeout=180)
-        if running and getattr(running, "status", None) == "running":
-            steps[3] = "✅ 4/4 سرور دوباره روشن شد"
-        else:
-            steps[3] = "⚠️ 4/4 دستور روشن شدن ارسال شد؛ وضعیت هنوز Running نشده"
-    except Exception as exc:
-        log.exception("Power on after Primary IPv4 swap failed")
-        steps[3] = "❌ 4/4 IP تعویض شد اما روشن کردن سرور خطا داد"
-        await safe_edit(
-            query,
-            swap_progress_text(server.name, old_value, str(new_ip.ip), steps)
-            + f"\n\nIP جدید متصل است؛ سرور را دستی روشن کنید.\n<code>{escape(str(exc))}</code>",
-            InlineKeyboardMarkup(
-                [
-                    [InlineKeyboardButton("🟢 روشن کردن سرور", callback_data=f"srv:on:{pidx}:{server_id}")],
-                    [InlineKeyboardButton("📦 Primary IPv4ها", callback_data=f"pips:{pidx}")],
-                    [InlineKeyboardButton("⬅️ برگشت به سرور", callback_data=f"srv:open:{pidx}:{server_id}")],
-                ]
-            ),
-        )
-        return
-
-    final_text = swap_progress_text(server.name, old_value, str(new_ip.ip), steps)
-    final_text += "\n\n✅ <b>تعویض Primary IPv4 با موفقیت انجام شد.</b>"
-    if old_value:
-        final_text += f"\n📦 IP قبلی <code>{escape(old_value)}</code> حذف نشده و اکنون در لیست Primary IPv4های پروژه آزاد است."
-    await safe_edit(
-        query,
-        final_text,
-        InlineKeyboardMarkup(
-            [
-                [InlineKeyboardButton("🖥 برگشت به سرور", callback_data=f"srv:open:{pidx}:{server_id}")],
-                [InlineKeyboardButton("📦 مدیریت IPv4های موجود", callback_data=f"pips:{pidx}")],
-            ]
-        ),
-    )
+                note = await recover_ipv4_swap(client, state)
+                path.unlink(missing_ok=True)
+            except Exception as recovery_exc:
+                log.exception("Primary IPv4 recovery incomplete")
+                note = f"بازیابی کامل نشد: {recovery_exc}. وضعیت سرور و اتصال IP را در Hetzner بررسی کنید؛ رکورد بازیابی برای راه‌اندازی بعدی ربات حفظ شد."
+        if new_ip:
+            note += f"\nIPv4 مقصد حذف نشده: {new_ip.ip}"
+        await swap_notice(query, f"❌ عملیات تعویض IP کامل نشد.\n<code>{escape(str(exc))}</code>\n\n{escape(note)}", markup)
+    finally:
+        _IP_SWAPS_ACTIVE.discard(server_id)
 
 
 async def show_project_traffic(query, pidx: int) -> None:
@@ -3799,7 +3859,7 @@ def validate_config() -> None:
 
 if __name__ == "__main__":
     validate_config()
-    app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+    app = ApplicationBuilder().token(TELEGRAM_TOKEN).post_init(recover_pending_ipv4_swaps).build()
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("servers", cmd_servers))
     app.add_handler(CommandHandler("traffic", cmd_traffic))

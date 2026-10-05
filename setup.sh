@@ -18,7 +18,7 @@ CYAN='\033[0;36m'
 BOLD='\033[1m'
 NC='\033[0m'
 
-INSTALLER_VERSION="16.1"
+INSTALLER_VERSION="16.2"
 LOCAL_RELEASE_DIR=""
 if [[ -f "${BASH_SOURCE[0]}" ]]; then
   candidate_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
