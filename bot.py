@@ -939,7 +939,7 @@ def cost_optimized_types_in_location(server_types: list, location_name: str) -> 
 
 
 _COST_MONITOR_LOCK = asyncio.Lock()
-_COST_MENU_CACHE: tuple[float, list, dict] | None = None
+_COST_MENU_CACHE: tuple[float, dict[str, list], dict] | None = None
 
 
 def cost_plan_locations(plan) -> dict[str, bool | None]:
@@ -971,87 +971,133 @@ async def fetch_cost_optimized_types() -> tuple[dict, list]:
     raise RuntimeError("هیچ پروژه‌ای برای دریافت فهرست پلن‌ها پاسخ نداد.") from last_exc
 
 
-def tracked_cost_plans(state: dict) -> set[str]:
-    # Older state files only stored a global toggle and an inventory snapshot.
-    return set(state.get("tracked_plans", []))
+def cost_plans_by_location(plans: list) -> dict[str, list]:
+    by_location: dict[str, list] = {}
+    for plan in plans:
+        for location, stock in cost_plan_locations(plan).items():
+            by_location.setdefault(location, []).append((plan, stock))
+    return by_location
 
 
-async def show_cost_optimized(query, *, refresh: bool = False) -> None:
+def migrate_cost_alerts(state: dict, catalog: dict[str, list]) -> bool:
+    """Keep previous plan-wide selections active in every supported location."""
+    if "tracked_plans" not in state or not catalog:
+        return False
+    old_plans = set(state.pop("tracked_plans"))
+    tracked = set(state.get("tracked_pairs", []))
+    tracked.update(
+        f"{location}|{plan.name}"
+        for location, plans in catalog.items()
+        for plan, _ in plans
+        if plan.name in old_plans
+    )
+    state["tracked_pairs"] = sorted(tracked)
+    return True
+
+
+async def cost_menu_data(refresh: bool = False) -> tuple[dict[str, list], dict, str]:
     global _COST_MENU_CACHE
     notice = ""
     if refresh or _COST_MENU_CACHE is None:
         try:
             project, plans = await fetch_cost_optimized_types()
             pricing = await asyncio.to_thread(_fetch_project_pricing, project) or {}
-            _COST_MENU_CACHE = (monotonic_time.monotonic(), plans, pricing)
+            _COST_MENU_CACHE = (monotonic_time.monotonic(), cost_plans_by_location(plans), pricing)
         except RuntimeError as exc:
             notice = str(exc)
-    plans = []
-    pricing = {}
-    if _COST_MENU_CACHE is not None:
-        checked, plans, pricing = _COST_MENU_CACHE
-        if notice or monotonic_time.monotonic() - checked > 60:
-            notice = "موجودیِ آخرین بررسی نمایش داده شده است. برای اطلاعات تازه، «بررسی دوباره» را بزنید."
+    if _COST_MENU_CACHE is None:
+        return {}, {}, notice
+    checked, catalog, pricing = _COST_MENU_CACHE
+    if notice or monotonic_time.monotonic() - checked > 60:
+        notice = "موجودیِ آخرین بررسی نمایش داده شده است. برای اطلاعات تازه، «بررسی دوباره» را بزنید."
+    return catalog, pricing, notice
 
-    state = read_availability_state()
+
+async def show_cost_optimized(query, location: str | None = None, *, refresh: bool = False) -> None:
+    catalog, pricing, notice = await cost_menu_data(refresh)
+    async with _COST_MONITOR_LOCK:
+        state = read_availability_state()
+        if migrate_cost_alerts(state, catalog):
+            write_availability_state(state)
+
     enabled = state.get("enabled", True)
-    selected = tracked_cost_plans(state)
-    rows = []
+    selected: dict[str, set[str]] = {}
+    for pair in state.get("tracked_pairs", []):
+        loc, _, name = pair.partition("|")
+        selected.setdefault(loc, set()).add(name)
+
     status = "🟢 روشن" if enabled else "⏸ متوقف"
     lines = [
         "💸 <b>موجودی Cost-Optimized</b>",
-        f"🔔 {status} · {len(selected)} پلن انتخاب‌شده · هر {CHEAP_CHECK_HOURS:g} ساعت",
-        "با زدن هر پلن، اعلان آن را خاموش یا روشن کنید.",
-        "قیمت ماهانه پایه و بدون IPv4 است. در صورت تفاوت قیمت، کمترین مبلغ درج می‌شود.",
+        f"🔔 اعلان‌ها {status} · بررسی هر {CHEAP_CHECK_HOURS:g} ساعت",
     ]
     if notice:
         lines.append(f"⚠️ {escape(notice)}")
-    if not plans and not notice:
-        lines.append("پلن Cost-Optimized در فهرست Hetzner گزارش نشد.")
+    rows = []
+
+    if location is None:
+        lines.append("لوکیشن موردنظر را برای انتخاب اعلان پلن‌ها باز کنید.")
+        for loc in sorted(catalog.keys() | selected.keys()):
+            plans = catalog.get(loc, [])
+            available = sum(stock is True for _, stock in plans)
+            count = len(selected.get(loc, ()))
+            stock_label = f"{available}/{len(plans)} موجود" if plans else "وضعیت نامشخص"
+            rows.append([InlineKeyboardButton(
+                f"📍 {loc.upper()} · {stock_label} · 🔔 {count}",
+                callback_data=f"cheap:loc:{loc}",
+            )])
+        if not rows and not notice:
+            lines.append("هتزنر لوکیشنی برای این پلن‌ها گزارش نکرد.")
+        auto_label = "🤖 سفارش فعال ساخت خودکار" if auto_create_active() else "🤖 ساخت خودکار هنگام موجود شدن"
+        rows.extend([
+            [
+                InlineKeyboardButton("🔄 بررسی دوباره", callback_data="cheap:refresh"),
+                InlineKeyboardButton(
+                    "⏸ توقف اعلان‌ها" if enabled else "▶️ ادامه اعلان‌ها",
+                    callback_data=f"cheap:monitor:{int(not enabled)}",
+                ),
+            ],
+            [InlineKeyboardButton(auto_label, callback_data="cheap:auto")],
+            [InlineKeyboardButton("📁 انتخاب پروژه برای ساخت", callback_data="projects")],
+            [InlineKeyboardButton("⬅️ منوی اصلی", callback_data="main")],
+        ])
+        await safe_edit(query, "\n".join(lines), InlineKeyboardMarkup(rows))
+        return
+
+    lines.extend([
+        f"📍 <b>{escape(location.upper())}</b>",
+        "برای تغییر اعلان هر پلن، دکمهٔ آن را لمس کنید.",
+        "قیمت ماهانهٔ همین لوکیشن بدون IPv4 است.",
+    ])
     currency = str(pricing.get("currency") or "EUR").upper()
-    for plan in plans:
-        active = plan.name in selected
-        locations = cost_plan_locations(plan)
-        available = sorted(loc for loc, stock in locations.items() if stock is True)
+    loc_key = _normalized_location(location)
+    plans = catalog.get(location, [])
+    active_plans = selected.get(location, set())
+    for plan, stock in plans:
+        active = plan.name in active_plans
         entry = _pricing_server_entry(pricing, plan) or {}
-        prices = server_type_monthly_prices(getattr(plan, "prices", None) or [])
-        prices.update(server_type_monthly_prices(entry.get("prices") or []))
-        monthly = [amount for loc, amount in prices.items() if not locations or loc in locations]
-        price = "قیمت نامشخص"
-        if monthly:
-            prefix = "از " if min(monthly) != max(monthly) else ""
-            price = f"{prefix}{min(monthly):.2f} {currency}/mo"
+        monthly = server_type_monthly_prices(entry.get("prices") or []).get(loc_key)
+        if monthly is None:
+            monthly = server_type_monthly_prices(getattr(plan, "prices", None) or []).get(loc_key)
+        price = f"{monthly:.2f} {currency}/mo" if monthly is not None else "قیمت نامشخص"
         rows.append([InlineKeyboardButton(
             f"{'🟢' if active else '⚪'} {plan.name.upper()} · {plan.cores or '—'} vCPU · {plan.memory or 0:g} GB · {price}",
-            callback_data=f"cheap:plan:{int(not active)}:{plan.name}",
+            callback_data=f"cheap:pair:{int(not active)}:{location}:{plan.name}",
             api_kwargs={"style": "success"} if active else None,
         )])
-        if available:
-            stock_text = "، ".join(escape(loc) for loc in available)
-        elif locations and all(stock is False for stock in locations.values()):
-            stock_text = "ناموجود"
-        else:
-            stock_text = "نامشخص"
-        lines.append(f"<code>{escape(plan.name.upper())}</code> · {stock_text}")
-    if plans:
-        for name in sorted(selected - {plan.name for plan in plans}):
-            rows.append([InlineKeyboardButton(
-                f"🟢 {name.upper()} · حذف از اعلان‌ها",
-                callback_data=f"cheap:plan:0:{name}",
-                api_kwargs={"style": "success"},
-            )])
-    auto_label = "🤖 سفارش فعال ساخت خودکار" if auto_create_active() else "🤖 ساخت خودکار هنگام موجود شدن"
-    rows.extend([
-        [
-            InlineKeyboardButton("🔄 بررسی دوباره", callback_data="cheap:refresh"),
-            InlineKeyboardButton(
-                "⏸ توقف اعلان‌ها" if enabled else "▶️ ادامه اعلان‌ها",
-                callback_data=f"cheap:monitor:{int(not enabled)}",
-            ),
-        ],
-        [InlineKeyboardButton(auto_label, callback_data="cheap:auto")],
-        [InlineKeyboardButton("📁 انتخاب پروژه برای ساخت", callback_data="projects")],
-        [InlineKeyboardButton("⬅️ منوی اصلی", callback_data="main")],
+        stock_label = {True: "موجود", False: "ناموجود", None: "نامشخص"}.get(stock, "نامشخص")
+        lines.append(f"<code>{escape(plan.name.upper())}</code> · {stock_label}")
+    if not plans:
+        lines.append("اطلاعات پلن‌های این لوکیشن در دسترس نیست.")
+    for name in sorted(active_plans - {plan.name for plan, _ in plans}):
+        rows.append([InlineKeyboardButton(
+            f"🟢 {name.upper()} · حذف از اعلان‌ها",
+            callback_data=f"cheap:pair:0:{location}:{name}",
+            api_kwargs={"style": "success"},
+        )])
+    rows.append([
+        InlineKeyboardButton("🔄 بررسی دوباره", callback_data=f"cheap:refresh:{location}"),
+        InlineKeyboardButton("⬅️ لوکیشن‌ها", callback_data="cheap:locations"),
     ])
     await safe_edit(query, "\n".join(lines), InlineKeyboardMarkup(rows))
 
@@ -2346,7 +2392,7 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 "• بعد از اتصال، دستور Linux برای افزودن IP نمایش داده می‌شود.\n"
                 "• Rescale فقط روی سرور خاموش انجام می‌شود.\n"
                 "• ساخت و حذف سرور از داخل هر پروژه انجام می‌شود؛ برای ساخت، نام را تایپ و بقیه گزینه‌ها را با دکمه انتخاب می‌کنید.\n"
-                f"• مانیتور Cost-Optimized هر {CHEAP_CHECK_HOURS:g} ساعت بررسی می‌کند و فقط برای پلن‌های انتخاب‌شده در صفحه موجودی اعلان می‌فرستد.\n"
+                f"• مانیتور Cost-Optimized هر {CHEAP_CHECK_HOURS:g} ساعت بررسی می‌کند و فقط برای پلن و لوکیشن انتخاب‌شده در صفحه موجودی اعلان می‌فرستد.\n"
                 "• هشدار 18/19/20 TB هر شب فقط یک بار در روز ارسال می‌شود.",
                 InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ منوی اصلی", callback_data="main")]]),
             )
@@ -2354,6 +2400,16 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if data in {"cheap:show", "cheap:refresh"}:
             await query.answer("در حال بررسی موجودی...")
             await show_cost_optimized(query, refresh=True)
+            return
+        if data == "cheap:locations" or data.startswith("cheap:plan:"):
+            await query.answer()
+            await show_cost_optimized(query)
+            return
+        location_action = re.fullmatch(r"cheap:(loc|refresh):([a-zA-Z0-9_-]{1,16})", data)
+        if location_action:
+            action, location = location_action.groups()
+            await query.answer()
+            await show_cost_optimized(query, location, refresh=action == "refresh")
             return
         if data == "cheap:auto":
             await query.answer()
@@ -2368,25 +2424,30 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             await query.answer("اعلان‌ها فعال شدند." if enabled else "اعلان‌ها متوقف شدند.")
             await show_cost_optimized(query)
             return
-        if data.startswith("cheap:plan:"):
-            _, _, action, name = data.split(":", 3)
-            if action not in {"0", "1"} or not re.fullmatch(r"[a-zA-Z0-9_-]{1,48}", name):
-                await query.answer("پلن نامعتبر است.", show_alert=True)
+        if data.startswith("cheap:pair:"):
+            match = re.fullmatch(r"cheap:pair:([01]):([a-zA-Z0-9_-]{1,16}):([a-zA-Z0-9_-]{1,34})", data)
+            if match is None:
+                await query.answer("پلن یا لوکیشن نامعتبر است.", show_alert=True)
+                return
+            action, location, name = match.groups()
+            catalog, _, _ = await cost_menu_data()
+            if action == "1" and not any(plan.name == name for plan, _ in catalog.get(location, [])):
+                await query.answer("این پلن در فهرست این لوکیشن نیست.", show_alert=True)
                 return
             async with _COST_MONITOR_LOCK:
                 state = read_availability_state()
-                tracked = tracked_cost_plans(state)
+                migrate_cost_alerts(state, catalog)
+                tracked = set(state.get("tracked_pairs", []))
+                pair = f"{location}|{name}"
                 if action == "1":
-                    tracked.add(name)
+                    tracked.add(pair)
                 else:
-                    tracked.discard(name)
-                    state["notified_pairs"] = [
-                        pair for pair in state.get("notified_pairs", []) if not pair.endswith(f"|{name}")
-                    ]
-                state["tracked_plans"] = sorted(tracked)
+                    tracked.discard(pair)
+                    state["notified_pairs"] = [item for item in state.get("notified_pairs", []) if item != pair]
+                state["tracked_pairs"] = sorted(tracked)
                 write_availability_state(state)
-            await query.answer(f"{name.upper()} {'فعال شد' if action == '1' else 'غیرفعال شد'}.")
-            await show_cost_optimized(query)
+            await query.answer(f"{name.upper()} · {location.upper()} {'فعال شد' if action == '1' else 'غیرفعال شد'}.")
+            await show_cost_optimized(query, location)
             return
         if data == "cost:report":
             await query.answer()
@@ -3832,7 +3893,9 @@ def write_availability_state(state: dict) -> None:
 
 async def cost_optimized_availability_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     state = read_availability_state()
-    if not ALLOWED_USER_ID or not state.get("enabled", True) or not tracked_cost_plans(state):
+    if not ALLOWED_USER_ID or not state.get("enabled", True):
+        return
+    if not (state.get("tracked_pairs") or state.get("tracked_plans")):
         return
     try:
         _, plans = await fetch_cost_optimized_types()
@@ -3843,17 +3906,22 @@ async def cost_optimized_availability_job(context: ContextTypes.DEFAULT_TYPE) ->
     async with _COST_MONITOR_LOCK:
         # Read again after the API request so a plan disabled meanwhile cannot trigger an alert.
         state = read_availability_state()
-        tracked = tracked_cost_plans(state)
-        if not state.get("enabled", True) or not tracked:
+        if not state.get("enabled", True):
+            return
+        catalog = cost_plans_by_location(plans)
+        if migrate_cost_alerts(state, catalog):
+            write_availability_state(state)
+        tracked = set(state.get("tracked_pairs", []))
+        if not tracked:
             return
         previous = set(state.get("notified_pairs", []))
         notified = previous.copy()
         new_stock = []
-        for plan in plans:
-            if plan.name not in tracked:
-                continue
-            for location, available in sorted(cost_plan_locations(plan).items()):
+        for location, entries in sorted(catalog.items()):
+            for plan, available in entries:
                 pair = f"{location}|{plan.name}"
+                if pair not in tracked:
+                    continue
                 if available is False:
                     notified.discard(pair)
                 elif available is True and pair not in previous:
