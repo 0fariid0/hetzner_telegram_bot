@@ -58,6 +58,8 @@ logging.basicConfig(
     level=logging.INFO,
 )
 log = logging.getLogger("hetzner-bot")
+# HTTPX's INFO messages include the Telegram bot token in the request URL.
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 STATUS_FA = {
     "running": "روشن",
@@ -233,8 +235,7 @@ def _normalized_location(value) -> str:
     return str(value or "").lower().replace("_", "-").strip()
 
 
-def _pricing_server_entry(pricing: dict, server) -> dict | None:
-    server_type = getattr(server, "server_type", None)
+def _pricing_server_entry(pricing: dict, server_type) -> dict | None:
     server_type_id = getattr(server_type, "id", None)
     server_type_name = str(getattr(server_type, "name", "") or "")
     for item in pricing.get("server_types") or []:
@@ -251,7 +252,7 @@ def _pricing_server_entry(pricing: dict, server) -> dict | None:
 
 def _pricing_server_price(pricing: dict, server) -> dict | None:
     """Resolve server pricing by exact server type and Location."""
-    entry = _pricing_server_entry(pricing, server)
+    entry = _pricing_server_entry(pricing, getattr(server, "server_type", None))
     if not entry:
         return None
     normalized = _normalized_location(server_location(server))
@@ -306,6 +307,22 @@ def _pricing_server_monthly(pricing: dict, server) -> tuple[float, str] | None:
     return price["monthly"], price["currency"]
 
 
+def server_type_monthly_prices(location_prices: list) -> dict[str, float]:
+    """Read location strings and monthly price dictionaries from the Hetzner API."""
+    prices = {}
+    for price in location_prices:
+        if not isinstance(price, dict):
+            continue
+        location = _normalized_location(price.get("location"))
+        monthly = price.get("price_monthly")
+        if isinstance(monthly, dict):
+            monthly = monthly.get(_configured_price_kind())
+        amount = _money_to_float(monthly)
+        if location and amount > 0:
+            prices[location] = amount
+    return prices
+
+
 def _fallback_server_monthly_price(server, server_types=None) -> tuple[float, str] | None:
     """SDK metadata fallback for temporary pricing API failures."""
     try:
@@ -314,21 +331,10 @@ def _fallback_server_monthly_price(server, server_types=None) -> tuple[float, st
             sid = getattr(st, "id", None)
             name = getattr(st, "name", None)
             st = next((x for x in server_types if getattr(x, "id", None) == sid or getattr(x, "name", None) == name), st)
-        prices = getattr(st, "prices", None) or []
-        loc = server_location(server)
-        normalized = str(loc).lower().replace("_", "-").strip()
-        candidates = []
-        for price in prices:
-            p_loc = getattr(getattr(price, "location", None), "name", None)
-            if p_loc and str(p_loc).lower().replace("_", "-").strip() == normalized:
-                candidates.append(price)
-        if not candidates and len(prices) == 1:
-            candidates = prices[:1]
-        if candidates:
-            monthly = getattr(candidates[0], "price_monthly", None)
-            amount = _money_to_float(monthly)
-            if amount:
-                return amount, str(getattr(monthly, "currency", None) or "EUR").upper()
+        prices = server_type_monthly_prices(getattr(st, "prices", None) or [])
+        amount = prices.get(_normalized_location(server_location(server)))
+        if amount is not None:
+            return amount, "EUR"
     except Exception:
         log.exception("SDK price fallback failed for server %s", getattr(server, "name", "?"))
     return None
@@ -932,105 +938,122 @@ def cost_optimized_types_in_location(server_types: list, location_name: str) -> 
     )
 
 
-def cost_optimized_matrix(server_types: list) -> dict[str, list]:
-    matrix: dict[str, list] = {}
-    for st in server_types:
-        if not is_cost_optimized_server_type(st):
+_COST_MONITOR_LOCK = asyncio.Lock()
+_COST_MENU_CACHE: tuple[float, list, dict] | None = None
+
+
+def cost_plan_locations(plan) -> dict[str, bool | None]:
+    """Treat unknown stock separately from a confirmed lack of capacity."""
+    now = datetime.now(timezone.utc)
+    locations = {}
+    for entry in getattr(plan, "locations", None) or []:
+        location = getattr(getattr(entry, "location", None), "name", None)
+        if not location:
             continue
-        for entry in getattr(st, "locations", None) or []:
-            if getattr(entry, "available", None) is not True:
-                continue
-            if getattr(entry, "deprecation", None) is not None:
-                continue
-            loc = getattr(entry, "location", None)
-            loc_name = getattr(loc, "name", None)
-            if not loc_name:
-                continue
-            matrix.setdefault(loc_name, []).append(st)
-    for loc_name in matrix:
-        matrix[loc_name].sort(key=lambda st: (getattr(st, "memory", 0) or 0, getattr(st, "cores", 0) or 0, st.name))
-    return dict(sorted(matrix.items()))
+        cutoff = getattr(getattr(entry, "deprecation", None), "unavailable_after", None)
+        if cutoff and cutoff <= now:
+            continue
+        locations[location] = getattr(entry, "available", None)
+    return locations
 
 
-def cost_optimized_text(matrix: dict[str, list], *, title: str = "💸 موجودی Cost-Optimized") -> str:
-    lines = [f"<b>{title}</b>", ""]
-    if not matrix:
-        lines.extend(
-            [
-                "در حال حاضر هیچ پلن Cost-Optimized قابل سفارشی از طریق API گزارش نشده است.",
-                "",
-                f"ربات هر <b>{CHEAP_CHECK_HOURS:g} ساعت</b> دوباره بررسی می‌کند.",
-            ]
-        )
-        return "\n".join(lines)
-    for loc_name, plans in matrix.items():
-        lines.append(f"📍 <b>{escape(loc_name)}</b>")
-        for st in plans:
-            arch = "ARM" if getattr(st, "architecture", "") == "arm" else "x86"
-            lines.append(
-                f"• <code>{escape(st.name)}</code> — {st.cores} vCPU / {st.memory:g} GB / {st.disk} GB — {arch}"
-            )
-        lines.append("")
-    lines.extend(
-        [
-            "⚠️ موجودی API یک شاخص لحظه‌ای است و Hetzner تضمین نمی‌کند مرحله نهایی Allocation همیشه موفق شود.",
-            f"🔄 بررسی خودکار: هر <b>{CHEAP_CHECK_HOURS:g} ساعت</b>",
-        ]
-    )
-    return "\n".join(lines)
-
-
-async def fetch_cost_optimized_matrix() -> tuple[dict, dict[str, list]]:
+async def fetch_cost_optimized_types() -> tuple[dict, list]:
     last_exc = None
     for project in PROJECTS:
         try:
-            server_types = await asyncio.to_thread(project["client"].server_types.get_all)
-            return project, cost_optimized_matrix(server_types)
+            types = await asyncio.to_thread(project["client"].server_types.get_all)
+            plans = [st for st in types if is_cost_optimized_server_type(st) and st.name]
+            plans.sort(key=lambda st: (st.name.lower().startswith("cax"), st.memory or 0, st.cores or 0, st.name))
+            return project, plans
         except Exception as exc:
             last_exc = exc
-            log.exception("Cost-Optimized availability check failed for project %s", project["name"])
-    raise RuntimeError(f"هیچ توکن فعالی برای بررسی موجودی پاسخ نداد: {last_exc}")
+            log.exception("Cost-Optimized catalog check failed for project %s", project["name"])
+    raise RuntimeError("هیچ پروژه‌ای برای دریافت فهرست پلن‌ها پاسخ نداد.") from last_exc
 
 
-def cost_monitor_enabled() -> bool:
+def tracked_cost_plans(state: dict) -> set[str]:
+    # Older state files only stored a global toggle and an inventory snapshot.
+    return set(state.get("tracked_plans", []))
+
+
+async def show_cost_optimized(query, *, refresh: bool = False) -> None:
+    global _COST_MENU_CACHE
+    notice = ""
+    if refresh or _COST_MENU_CACHE is None:
+        try:
+            project, plans = await fetch_cost_optimized_types()
+            pricing = await asyncio.to_thread(_fetch_project_pricing, project) or {}
+            _COST_MENU_CACHE = (monotonic_time.monotonic(), plans, pricing)
+        except RuntimeError as exc:
+            notice = str(exc)
+    plans = []
+    pricing = {}
+    if _COST_MENU_CACHE is not None:
+        checked, plans, pricing = _COST_MENU_CACHE
+        if notice or monotonic_time.monotonic() - checked > 60:
+            notice = "موجودیِ آخرین بررسی نمایش داده شده است. برای اطلاعات تازه، «بررسی دوباره» را بزنید."
+
     state = read_availability_state()
-    return bool(state.get("enabled", True))
-
-
-def set_cost_monitor_enabled(enabled: bool) -> None:
-    state = read_availability_state()
-    state["enabled"] = bool(enabled)
-    state["updated_at"] = datetime.now(ZoneInfo(BOT_TIMEZONE)).isoformat()
-    write_availability_state(state)
-
-
-async def show_cost_optimized(query, notice: str | None = None) -> None:
-    _, matrix = await fetch_cost_optimized_matrix()
-    enabled = cost_monitor_enabled()
-    text = cost_optimized_text(matrix)
-    status = "🟢 روشن" if enabled else "🔴 خاموش"
-    text += f"\n\n🔔 مانیتور: <b>{status}</b> — هر <b>{CHEAP_CHECK_HOURS:g} ساعت</b>"
-    auto = read_auto_create_state()
-    text += "\n🤖 ساخت خودکار: " + ("فعال" if auto_create_active(auto) else "غیرفعال")
+    enabled = state.get("enabled", True)
+    selected = tracked_cost_plans(state)
+    rows = []
+    status = "🟢 روشن" if enabled else "⏸ متوقف"
+    lines = [
+        "💸 <b>موجودی Cost-Optimized</b>",
+        f"🔔 {status} · {len(selected)} پلن انتخاب‌شده · هر {CHEAP_CHECK_HOURS:g} ساعت",
+        "با زدن هر پلن، اعلان آن را خاموش یا روشن کنید.",
+        "قیمت ماهانه پایه و بدون IPv4 است. در صورت تفاوت قیمت، کمترین مبلغ درج می‌شود.",
+    ]
     if notice:
-        text = f"{escape(notice)}\n\n{text}"
-
-    toggle_text = "🔕 خاموش کردن مانیتور" if enabled else "🔔 روشن کردن مانیتور"
-    await safe_edit(
-        query,
-        text,
-        InlineKeyboardMarkup(
-            [
-                [
-                    InlineKeyboardButton("🔄 بررسی دوباره", callback_data="cheap:show"),
-                    InlineKeyboardButton(toggle_text, callback_data="cheap:toggle"),
-                ],
-                [InlineKeyboardButton("🤖 ساخت خودکار هنگام موجود شدن", callback_data="cheap:auto")],
-                [InlineKeyboardButton("📁 انتخاب پروژه برای ساخت", callback_data="projects")],
-                [InlineKeyboardButton("⬅️ منوی اصلی", callback_data="main")],
-            ]
-        ),
-    )
+        lines.append(f"⚠️ {escape(notice)}")
+    if not plans and not notice:
+        lines.append("پلن Cost-Optimized در فهرست Hetzner گزارش نشد.")
+    currency = str(pricing.get("currency") or "EUR").upper()
+    for plan in plans:
+        active = plan.name in selected
+        locations = cost_plan_locations(plan)
+        available = sorted(loc for loc, stock in locations.items() if stock is True)
+        entry = _pricing_server_entry(pricing, plan) or {}
+        prices = server_type_monthly_prices(getattr(plan, "prices", None) or [])
+        prices.update(server_type_monthly_prices(entry.get("prices") or []))
+        monthly = [amount for loc, amount in prices.items() if not locations or loc in locations]
+        price = "قیمت نامشخص"
+        if monthly:
+            prefix = "از " if min(monthly) != max(monthly) else ""
+            price = f"{prefix}{min(monthly):.2f} {currency}/mo"
+        rows.append([InlineKeyboardButton(
+            f"{'🟢' if active else '⚪'} {plan.name.upper()} · {plan.cores or '—'} vCPU · {plan.memory or 0:g} GB · {price}",
+            callback_data=f"cheap:plan:{int(not active)}:{plan.name}",
+            api_kwargs={"style": "success"} if active else None,
+        )])
+        if available:
+            stock_text = "، ".join(escape(loc) for loc in available)
+        elif locations and all(stock is False for stock in locations.values()):
+            stock_text = "ناموجود"
+        else:
+            stock_text = "نامشخص"
+        lines.append(f"<code>{escape(plan.name.upper())}</code> · {stock_text}")
+    if plans:
+        for name in sorted(selected - {plan.name for plan in plans}):
+            rows.append([InlineKeyboardButton(
+                f"🟢 {name.upper()} · حذف از اعلان‌ها",
+                callback_data=f"cheap:plan:0:{name}",
+                api_kwargs={"style": "success"},
+            )])
+    auto_label = "🤖 سفارش فعال ساخت خودکار" if auto_create_active() else "🤖 ساخت خودکار هنگام موجود شدن"
+    rows.extend([
+        [
+            InlineKeyboardButton("🔄 بررسی دوباره", callback_data="cheap:refresh"),
+            InlineKeyboardButton(
+                "⏸ توقف اعلان‌ها" if enabled else "▶️ ادامه اعلان‌ها",
+                callback_data=f"cheap:monitor:{int(not enabled)}",
+            ),
+        ],
+        [InlineKeyboardButton(auto_label, callback_data="cheap:auto")],
+        [InlineKeyboardButton("📁 انتخاب پروژه برای ساخت", callback_data="projects")],
+        [InlineKeyboardButton("⬅️ منوی اصلی", callback_data="main")],
+    ])
+    await safe_edit(query, "\n".join(lines), InlineKeyboardMarkup(rows))
 
 
 def auto_create_active(state: dict | None = None) -> bool:
@@ -2323,28 +2346,47 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 "• بعد از اتصال، دستور Linux برای افزودن IP نمایش داده می‌شود.\n"
                 "• Rescale فقط روی سرور خاموش انجام می‌شود.\n"
                 "• ساخت و حذف سرور از داخل هر پروژه انجام می‌شود؛ برای ساخت، نام را تایپ و بقیه گزینه‌ها را با دکمه انتخاب می‌کنید.\n"
-                f"• مانیتور Cost-Optimized هر {CHEAP_CHECK_HOURS:g} ساعت بررسی می‌کند و از صفحه موجودی قابل روشن/خاموش کردن است.\n"
+                f"• مانیتور Cost-Optimized هر {CHEAP_CHECK_HOURS:g} ساعت بررسی می‌کند و فقط برای پلن‌های انتخاب‌شده در صفحه موجودی اعلان می‌فرستد.\n"
                 "• هشدار 18/19/20 TB هر شب فقط یک بار در روز ارسال می‌شود.",
                 InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ منوی اصلی", callback_data="main")]]),
             )
             return
-        if data == "cheap:show":
+        if data in {"cheap:show", "cheap:refresh"}:
             await query.answer("در حال بررسی موجودی...")
-            await show_cost_optimized(query)
+            await show_cost_optimized(query, refresh=True)
             return
         if data == "cheap:auto":
             await query.answer()
             await show_auto_create(query)
             return
-        if data == "cheap:toggle":
-            current = cost_monitor_enabled()
-            new_state = not current
-            set_cost_monitor_enabled(new_state)
-            await query.answer("مانیتور روشن شد." if new_state else "مانیتور خاموش شد.")
-            await show_cost_optimized(
-                query,
-                "✅ مانیتور Cost-Optimized روشن شد." if new_state else "⏸ مانیتور Cost-Optimized خاموش شد.",
-            )
+        if data == "cheap:toggle" or data in {"cheap:monitor:0", "cheap:monitor:1"}:
+            async with _COST_MONITOR_LOCK:
+                state = read_availability_state()
+                enabled = not state.get("enabled", True) if data == "cheap:toggle" else data.endswith(":1")
+                state["enabled"] = enabled
+                write_availability_state(state)
+            await query.answer("اعلان‌ها فعال شدند." if enabled else "اعلان‌ها متوقف شدند.")
+            await show_cost_optimized(query)
+            return
+        if data.startswith("cheap:plan:"):
+            _, _, action, name = data.split(":", 3)
+            if action not in {"0", "1"} or not re.fullmatch(r"[a-zA-Z0-9_-]{1,48}", name):
+                await query.answer("پلن نامعتبر است.", show_alert=True)
+                return
+            async with _COST_MONITOR_LOCK:
+                state = read_availability_state()
+                tracked = tracked_cost_plans(state)
+                if action == "1":
+                    tracked.add(name)
+                else:
+                    tracked.discard(name)
+                    state["notified_pairs"] = [
+                        pair for pair in state.get("notified_pairs", []) if not pair.endswith(f"|{name}")
+                    ]
+                state["tracked_plans"] = sorted(tracked)
+                write_availability_state(state)
+            await query.answer(f"{name.upper()} {'فعال شد' if action == '1' else 'غیرفعال شد'}.")
+            await show_cost_optimized(query)
             return
         if data == "cost:report":
             await query.answer()
@@ -3770,55 +3812,73 @@ async def auto_create_job(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 def read_availability_state() -> dict:
     try:
-        if AVAILABILITY_STATE_FILE.exists():
-            return json.loads(AVAILABILITY_STATE_FILE.read_text(encoding="utf-8"))
-    except Exception:
+        state = json.loads(AVAILABILITY_STATE_FILE.read_text(encoding="utf-8"))
+        if not isinstance(state, dict):
+            raise ValueError("Expected an availability state object")
+        return state
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError):
         log.exception("Could not read Cost-Optimized availability state")
-    return {}
+        raise
 
 
 def write_availability_state(state: dict) -> None:
-    try:
-        AVAILABILITY_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-        tmp = AVAILABILITY_STATE_FILE.with_suffix(".tmp")
-        tmp.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
-        tmp.replace(AVAILABILITY_STATE_FILE)
-    except Exception:
-        log.exception("Could not write Cost-Optimized availability state")
-
-
-def availability_pairs(matrix: dict[str, list]) -> list[str]:
-    return sorted(f"{loc}|{st.name}" for loc, plans in matrix.items() for st in plans)
+    AVAILABILITY_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    tmp = AVAILABILITY_STATE_FILE.with_name(f"{AVAILABILITY_STATE_FILE.name}.tmp")
+    tmp.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
+    tmp.replace(AVAILABILITY_STATE_FILE)
 
 
 async def cost_optimized_availability_job(context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not ALLOWED_USER_ID or not cost_monitor_enabled():
+    state = read_availability_state()
+    if not ALLOWED_USER_ID or not state.get("enabled", True) or not tracked_cost_plans(state):
         return
     try:
-        _, matrix = await fetch_cost_optimized_matrix()
-    except Exception:
+        _, plans = await fetch_cost_optimized_types()
+    except RuntimeError:
         log.exception("Cost-Optimized availability job failed")
         return
-    current = availability_pairs(matrix)
-    state = read_availability_state()
-    previous = set(state.get("available_pairs", []))
-    new_pairs = set(current) - previous
-    state["available_pairs"] = current
-    state["last_checked_at"] = datetime.now(ZoneInfo(BOT_TIMEZONE)).isoformat()
-    write_availability_state(state)
-    if not new_pairs:
-        return
-    text = cost_optimized_text(matrix, title="🔔 Cost-Optimized موجود شد")
-    text += "\n\n<b>موجودی جدید:</b>\n" + "\n".join(
-        f"• <code>{escape(pair.split('|', 1)[1])}</code> در <code>{escape(pair.split('|', 1)[0])}</code>"
-        for pair in sorted(new_pairs)
-    )
-    await context.bot.send_message(
-        chat_id=int(ALLOWED_USER_ID),
-        text=clip(text),
-        parse_mode=ParseMode.HTML,
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📁 انتخاب پروژه برای ساخت", callback_data="projects")]]),
-    )
+
+    async with _COST_MONITOR_LOCK:
+        # Read again after the API request so a plan disabled meanwhile cannot trigger an alert.
+        state = read_availability_state()
+        tracked = tracked_cost_plans(state)
+        if not state.get("enabled", True) or not tracked:
+            return
+        previous = set(state.get("notified_pairs", []))
+        notified = previous.copy()
+        new_stock = []
+        for plan in plans:
+            if plan.name not in tracked:
+                continue
+            for location, available in sorted(cost_plan_locations(plan).items()):
+                pair = f"{location}|{plan.name}"
+                if available is False:
+                    notified.discard(pair)
+                elif available is True and pair not in previous:
+                    line = (
+                        f"📍 <code>{escape(location)}</code> · "
+                        f"<b>{escape(plan.name.upper())}</b> · {plan.cores or '—'} vCPU / {plan.memory or 0:g} GB"
+                    )
+                    new_stock.append((pair, line))
+
+        if notified != previous:
+            state["notified_pairs"] = sorted(notified)
+            write_availability_state(state)
+
+        # Keep each message within the Telegram length limit and persist only successful batches.
+        for start in range(0, len(new_stock), 25):
+            batch = new_stock[start:start + 25]
+            await context.bot.send_message(
+                chat_id=int(ALLOWED_USER_ID),
+                text="🔔 <b>موجودی جدید Cost-Optimized</b>\n\n" + "\n".join(line for _, line in batch),
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("💸 موجودی Cost-Optimized", callback_data="cheap:show")]]),
+            )
+            notified.update(pair for pair, _ in batch)
+            state["notified_pairs"] = sorted(notified)
+            write_availability_state(state)
 
 
 def parse_job_time() -> time:
